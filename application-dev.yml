@@ -1,0 +1,63 @@
+# ==========================================
+# 开发环境配置 (DEV)
+# 适用于：开发、测试、小数据量迁移
+# ==========================================
+
+server:
+  port: 8088
+
+spring:
+  batch:
+    jdbc:
+      initialize-schema: embedded
+    job:
+      enabled: false
+      
+  datasource:
+    dynamic:
+      primary: master
+      strict: false
+      hikari:
+        # 开发环境连接池配置（较小）
+        maximum-pool-size: 20
+        minimum-idle: 5
+        connection-timeout: 30000
+        idle-timeout: 600000
+        max-lifetime: 1800000
+        
+      datasource:
+        # 源数据库 - SQL Server
+        master:
+          driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
+          url: jdbc:sqlserver://10.5.80.179:1433;databaseName=OctOBackFT_1231;encrypt=true;trustServerCertificate=true
+          username: pleung
+          password: 123456
+          hikari:
+            maximum-pool-size: 15
+            minimum-idle: 5
+            
+        # 目标数据库 - Oracle
+        oracle:
+          driver-class-name: oracle.jdbc.OracleDriver
+          url: jdbc:oracle:thin:@//10.11.198.16:1721/MSEUZ
+          username: JTQAMSSAPP
+          password: JTQAMSSAPP!
+          hikari:
+            maximum-pool-size: 15
+            minimum-idle: 5
+
+# MyBatis Plus 开发环境配置
+mybatis-plus:
+  configuration:
+    # 开发环境开启SQL日志
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# 日志配置 - 开发环境
+logging:
+  level:
+    root: INFO
+    org.example: DEBUG
+    org.springframework.batch: DEBUG
+    com.baomidou.dynamic: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"

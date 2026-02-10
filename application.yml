@@ -1,0 +1,19 @@
+# ==========================================
+# 主配置文件 - 通用配置和默认环境
+# ==========================================
+
+spring:
+  profiles:
+    active: dev  # 默认激活dev环境
+
+  # 通用配置
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+
+# MyBatis Plus 通用配置
+mybatis-plus:
+  type-aliases-package: org.example.pojo
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-camel-case: true
