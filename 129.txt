@@ -1,3 +1,119 @@
+WITH AllOperations AS (
+    -- INSERT 操作：一条记录
+    SELECT 
+        SeqNo,
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogAction,
+        'NEW' AS ChangeType,
+        LogColumn,
+        AfterValue AS FieldValue
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'INSERT'
+        AND AfterValue IS NOT NULL
+    
+    UNION ALL
+    
+    -- UPDATE 操作：两条记录（OLD 和 NEW）
+    SELECT 
+        SeqNo,
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogAction,
+        'OLD' AS ChangeType,
+        LogColumn,
+        BeforeValue AS FieldValue
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'UPDATE'
+        AND BeforeValue IS NOT NULL
+    
+    UNION ALL
+    
+    SELECT 
+        SeqNo,
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogAction,
+        'NEW' AS ChangeType,
+        LogColumn,
+        AfterValue AS FieldValue
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'UPDATE'
+        AND AfterValue IS NOT NULL
+)
+SELECT 
+    SeqNo,
+    InstrumentCode,
+    Market,
+    LogDateTime,
+    LogAction,
+    ChangeType,
+    LogColumn,
+    FieldValue
+FROM AllOperations
+ORDER BY InstrumentCode, Market, LogDateTime DESC, SeqNo DESC, LogColumn
+555555555555555
+WITH UpdatePairs AS (
+    SELECT 
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogColumn,
+        BeforeValue AS OldValue,
+        AfterValue AS NewValue,
+        LogUserName,
+        LogHostName,
+        ROW_NUMBER() OVER (
+            PARTITION BY TableKey1, TableKey2, LogColumn, LogDateTime
+            ORDER BY SeqNo
+        ) AS rn
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'UPDATE'
+        AND (BeforeValue IS NOT NULL OR AfterValue IS NOT NULL)
+),
+InsertValues AS (
+    SELECT 
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogColumn,
+        NULL AS OldValue,
+        AfterValue AS NewValue,
+        LogUserName,
+        LogHostName
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'INSERT'
+        AND AfterValue IS NOT NULL
+)
+SELECT 
+    InstrumentCode,
+    Market,
+    LogDateTime,
+    LogColumn,
+    OldValue,
+    NewValue,
+    CASE 
+        WHEN OldValue IS NULL AND NewValue IS NOT NULL THEN 'INSERT'
+        ELSE 'UPDATE'
+    END AS OperationType,
+    LogUserName,
+    LogHostName
+FROM (
+    SELECT * FROM UpdatePairs WHERE rn = 1
+    UNION ALL
+    SELECT * FROM InsertValues
+) t
+ORDER BY InstrumentCode, Market, LogDateTime DESC, LogColumn
+
+555555555555555555555
 WITH InstrumentLogs AS (
     -- 处理 INSERT 操作：生成一条记录（新值）
     SELECT 
