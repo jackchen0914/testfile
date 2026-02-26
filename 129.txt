@@ -1,97 +1,116 @@
--- 查询每个 Instrument 的完整记录（最新版本）
 WITH InstrumentLogs AS (
+    -- 处理 INSERT 操作：生成一条记录（新值）
     SELECT 
-        TableKey1 AS Instrument,
+        TableKey1 AS InstrumentCode,
         TableKey2 AS Market,
         LogDateTime,
         LogAction,
         LogColumn,
-        -- 如果是 UPDATE，取 AfterValue；如果是 INSERT，取 BeforeValue（根据您的数据结构调整）
-        CASE 
-            WHEN LogAction = 'UPDATE' THEN AfterValue
-            ELSE BeforeValue  -- INSERT 操作的值在 BeforeValue 中
-        END AS FieldValue,
-        -- 为每个字段按时间排序
+        'NEW' AS ValueType,  -- 标识是新值
+        AfterValue AS FieldValue,  -- INSERT 取 AfterValue
+        SeqNo,
         ROW_NUMBER() OVER (
-            PARTITION BY TableKey1, TableKey2, LogColumn 
+            PARTITION BY TableKey1, TableKey2, LogColumn, 'NEW'
             ORDER BY LogDateTime DESC, SeqNo DESC
         ) AS rn
     FROM GenericLog
-    WHERE LogTable = 'Instrument'
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'INSERT'
+        AND AfterValue IS NOT NULL
+    
+    UNION ALL
+    
+    -- 处理 UPDATE 操作：生成两条记录（旧值和新值）
+    -- 旧值记录
+    SELECT 
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogAction,
+        LogColumn,
+        'OLD' AS ValueType,
+        BeforeValue AS FieldValue,
+        SeqNo,
+        ROW_NUMBER() OVER (
+            PARTITION BY TableKey1, TableKey2, LogColumn, 'OLD'
+            ORDER BY LogDateTime DESC, SeqNo DESC
+        ) AS rn
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'UPDATE'
+        AND BeforeValue IS NOT NULL
+    
+    UNION ALL
+    
+    -- 新值记录
+    SELECT 
+        TableKey1 AS InstrumentCode,
+        TableKey2 AS Market,
+        LogDateTime,
+        LogAction,
+        LogColumn,
+        'NEW' AS ValueType,
+        AfterValue AS FieldValue,
+        SeqNo,
+        ROW_NUMBER() OVER (
+            PARTITION BY TableKey1, TableKey2, LogColumn, 'NEW'
+            ORDER BY LogDateTime DESC, SeqNo DESC
+        ) AS rn
+    FROM GenericLog
+    WHERE LogTable = 'Instrument' 
+        AND LogAction = 'UPDATE'
+        AND AfterValue IS NOT NULL
 )
 SELECT 
-    Instrument,
+    InstrumentCode,
     Market,
-    MAX(CASE WHEN LogColumn = 'Instrument' THEN FieldValue END) AS Instrument,
-    MAX(CASE WHEN LogColumn = 'Market' THEN FieldValue END) AS Market,
-    MAX(CASE WHEN LogColumn = 'Name' THEN FieldValue END) AS Name,
-    MAX(CASE WHEN LogColumn = 'ShortName' THEN FieldValue END) AS ShortName,
-    MAX(CASE WHEN LogColumn = 'CName' THEN FieldValue END) AS CName,
-    MAX(CASE WHEN LogColumn = 'CShortName' THEN FieldValue END) AS CShortName,
-    MAX(CASE WHEN LogColumn = 'InstrumentClass' THEN FieldValue END) AS InstrumentClass,
-    MAX(CASE WHEN LogColumn = 'ProdCode' THEN FieldValue END) AS ProdCode,
-    MAX(CASE WHEN LogColumn = 'LotSize' THEN FieldValue END) AS LotSize,
-    MAX(CASE WHEN LogColumn = 'Price' THEN FieldValue END) AS Price,
-    MAX(CASE WHEN LogColumn = 'TransactionValueLimit' THEN FieldValue END) AS TransactionValueLimit,
-    MAX(CASE WHEN LogColumn = 'TransactionQtyLimit' THEN FieldValue END) AS TransactionQtyLimit,
-    MAX(CASE WHEN LogColumn = 'DailyValueLimit' THEN FieldValue END) AS DailyValueLimit,
-    MAX(CASE WHEN LogColumn = 'DailyQtyLimit' THEN FieldValue END) AS DailyQtyLimit,
-    MAX(CASE WHEN LogColumn = 'ExpiryDate' THEN FieldValue END) AS ExpiryDate,
-    MAX(CASE WHEN LogColumn = 'Active' THEN FieldValue END) AS Active,
-    MAX(CASE WHEN LogColumn = 'MarginPercent' THEN FieldValue END) AS MarginPercent,
-    MAX(CASE WHEN LogColumn = 'Series' THEN FieldValue END) AS Series,
-    MAX(CASE WHEN LogColumn = 'PriceCap' THEN FieldValue END) AS PriceCap,
-    MAX(CASE WHEN LogColumn = 'CalculationPrice' THEN FieldValue END) AS CalculationPrice,
-    MAX(CASE WHEN LogColumn = 'Suspended' THEN FieldValue END) AS Suspended,
-    MAX(CASE WHEN LogColumn = 'TradingCCY' THEN FieldValue END) AS TradingCCY,
-    MAX(CASE WHEN LogColumn = 'ExchangeCode' THEN FieldValue END) AS ExchangeCode,
-    MAX(CASE WHEN LogColumn = 'ExchangeInternalCode' THEN FieldValue END) AS ExchangeInternalCode,
-    MAX(CASE WHEN LogColumn = 'Bloomberg' THEN FieldValue END) AS Bloomberg,
-    MAX(CASE WHEN LogColumn = 'Reuter' THEN FieldValue END) AS Reuter,
-    MAX(CASE WHEN LogColumn = 'ISIN' THEN FieldValue END) AS ISIN,
-    MAX(CASE WHEN LogColumn = 'Sedol' THEN FieldValue END) AS Sedol,
-    MAX(CASE WHEN LogColumn = 'FirstDealingDate' THEN FieldValue END) AS FirstDealingDate,
-    MAX(CASE WHEN LogColumn = 'LastDealingDate' THEN FieldValue END) AS LastDealingDate,
-    MAX(CASE WHEN LogColumn = 'ElectronicClearing' THEN FieldValue END) AS ElectronicClearing,
-    MAX(CASE WHEN LogColumn = 'ShortSell' THEN FieldValue END) AS ShortSell,
-    MAX(CASE WHEN LogColumn = 'ParValue' THEN FieldValue END) AS ParValue,
-    MAX(CASE WHEN LogColumn = 'Fee1' THEN FieldValue END) AS Fee1,
-    MAX(CASE WHEN LogColumn = 'Fee2' THEN FieldValue END) AS Fee2,
-    MAX(CASE WHEN LogColumn = 'Fee3' THEN FieldValue END) AS Fee3,
-    MAX(CASE WHEN LogColumn = 'Fee4' THEN FieldValue END) AS Fee4,
-    MAX(CASE WHEN LogColumn = 'Fee5' THEN FieldValue END) AS Fee5,
-    MAX(CASE WHEN LogColumn = 'Fee6' THEN FieldValue END) AS Fee6,
-    MAX(CASE WHEN LogColumn = 'Fee7' THEN FieldValue END) AS Fee7,
-    MAX(CASE WHEN LogColumn = 'Fee8' THEN FieldValue END) AS Fee8,
-    MAX(CASE WHEN LogColumn = 'Fee9' THEN FieldValue END) AS Fee9,
-    MAX(CASE WHEN LogColumn = 'Fee10' THEN FieldValue END) AS Fee10,
-    MAX(CASE WHEN LogColumn = 'Category' THEN FieldValue END) AS Category,
-    MAX(CASE WHEN LogColumn = 'SpreadTableCode' THEN FieldValue END) AS SpreadTableCode,
-    MAX(CASE WHEN LogColumn = 'StatusFlag' THEN FieldValue END) AS StatusFlag,
-    MAX(CASE WHEN LogColumn = 'InstrumentType' THEN FieldValue END) AS InstrumentType,
-    MAX(CASE WHEN LogColumn = 'DateOfListed' THEN FieldValue END) AS DateOfListed,
-    MAX(CASE WHEN LogColumn = 'IlliquidCollateral' THEN FieldValue END) AS IlliquidCollateral,
-    MAX(CASE WHEN LogColumn = 'SyncRef' THEN FieldValue END) AS SyncRef,
-    MAX(CASE WHEN LogColumn = 'UnderMarket' THEN FieldValue END) AS UnderMarket,
-    MAX(CASE WHEN LogColumn = 'UnderStock' THEN FieldValue END) AS UnderStock,
-    MAX(CASE WHEN LogColumn = 'SuspendFrom' THEN FieldValue END) AS SuspendFrom,
-    MAX(CASE WHEN LogColumn = 'LastSuspendPrice' THEN FieldValue END) AS LastSuspendPrice,
-    MAX(CASE WHEN LogColumn = 'InstDepCode' THEN FieldValue END) AS InstDepCode,
-    MAX(CASE WHEN LogColumn = 'InstLocation' THEN FieldValue END) AS InstLocation,
-    MAX(CASE WHEN LogColumn = 'NAVDate' THEN FieldValue END) AS NAVDate,
-    MAX(CASE WHEN LogColumn = 'CollateralRatio' THEN FieldValue END) AS CollateralRatio,
-    MAX(CASE WHEN LogColumn = 'InterestRateCategory' THEN FieldValue END) AS InterestRateCategory,
-    MAX(CASE WHEN LogColumn = 'NoBuy' THEN FieldValue END) AS NoBuy,
-    MAX(CASE WHEN LogColumn = 'NoSell' THEN FieldValue END) AS NoSell,
-    MAX(CASE WHEN LogColumn = 'SellOnlyByCSC' THEN FieldValue END) AS SellOnlyByCSC,
-    MAX(CASE WHEN LogColumn = 'GlobalInstrumentType' THEN FieldValue END) AS GlobalInstrumentType,
-    MAX(CASE WHEN LogColumn = 'IDCInstrumentType' THEN FieldValue END) AS IDCInstrumentType,
-    MAX(CASE WHEN LogColumn = 'Tier' THEN FieldValue END) AS Tier,
-    -- 元数据字段
-    MAX(LogDateTime) AS LastModifiedDateTime,
-    MAX(CASE WHEN LogColumn = 'LogHostName' THEN FieldValue END) AS LogHostName,
-    MAX(CASE WHEN LogColumn = 'LogUserName' THEN FieldValue END) AS LogUserName
+    -- 基础字段
+    MAX(CASE WHEN LogColumn = 'Instrument' AND ValueType = 'NEW' THEN FieldValue END) AS Instrument_New,
+    MAX(CASE WHEN LogColumn = 'Instrument' AND ValueType = 'OLD' THEN FieldValue END) AS Instrument_Old,
+    
+    MAX(CASE WHEN LogColumn = 'Market' AND ValueType = 'NEW' THEN FieldValue END) AS Market_New,
+    MAX(CASE WHEN LogColumn = 'Market' AND ValueType = 'OLD' THEN FieldValue END) AS Market_Old,
+    
+    MAX(CASE WHEN LogColumn = 'Name' AND ValueType = 'NEW' THEN FieldValue END) AS Name_New,
+    MAX(CASE WHEN LogColumn = 'Name' AND ValueType = 'OLD' THEN FieldValue END) AS Name_Old,
+    
+    MAX(CASE WHEN LogColumn = 'ShortName' AND ValueType = 'NEW' THEN FieldValue END) AS ShortName_New,
+    MAX(CASE WHEN LogColumn = 'ShortName' AND ValueType = 'OLD' THEN FieldValue END) AS ShortName_Old,
+    
+    MAX(CASE WHEN LogColumn = 'CName' AND ValueType = 'NEW' THEN FieldValue END) AS CName_New,
+    MAX(CASE WHEN LogColumn = 'CName' AND ValueType = 'OLD' THEN FieldValue END) AS CName_Old,
+    
+    MAX(CASE WHEN LogColumn = 'CShortName' AND ValueType = 'NEW' THEN FieldValue END) AS CShortName_New,
+    MAX(CASE WHEN LogColumn = 'CShortName' AND ValueType = 'OLD' THEN FieldValue END) AS CShortName_Old,
+    
+    MAX(CASE WHEN LogColumn = 'InstrumentClass' AND ValueType = 'NEW' THEN FieldValue END) AS InstrumentClass_New,
+    MAX(CASE WHEN LogColumn = 'InstrumentClass' AND ValueType = 'OLD' THEN FieldValue END) AS InstrumentClass_Old,
+    
+    MAX(CASE WHEN LogColumn = 'ProdCode' AND ValueType = 'NEW' THEN FieldValue END) AS ProdCode_New,
+    MAX(CASE WHEN LogColumn = 'ProdCode' AND ValueType = 'OLD' THEN FieldValue END) AS ProdCode_Old,
+    
+    MAX(CASE WHEN LogColumn = 'LotSize' AND ValueType = 'NEW' THEN FieldValue END) AS LotSize_New,
+    MAX(CASE WHEN LogColumn = 'LotSize' AND ValueType = 'OLD' THEN FieldValue END) AS LotSize_Old,
+    
+    MAX(CASE WHEN LogColumn = 'Price' AND ValueType = 'NEW' THEN FieldValue END) AS Price_New,
+    MAX(CASE WHEN LogColumn = 'Price' AND ValueType = 'OLD' THEN FieldValue END) AS Price_Old,
+    
+    MAX(CASE WHEN LogColumn = 'TransactionValueLimit' AND ValueType = 'NEW' THEN FieldValue END) AS TransactionValueLimit_New,
+    MAX(CASE WHEN LogColumn = 'TransactionValueLimit' AND ValueType = 'OLD' THEN FieldValue END) AS TransactionValueLimit_Old,
+    
+    MAX(CASE WHEN LogColumn = 'ExpiryDate' AND ValueType = 'NEW' THEN FieldValue END) AS ExpiryDate_New,
+    MAX(CASE WHEN LogColumn = 'ExpiryDate' AND ValueType = 'OLD' THEN FieldValue END) AS ExpiryDate_Old,
+    
+    MAX(CASE WHEN LogColumn = 'Active' AND ValueType = 'NEW' THEN FieldValue END) AS Active_New,
+    MAX(CASE WHEN LogColumn = 'Active' AND ValueType = 'OLD' THEN FieldValue END) AS Active_Old,
+    
+    -- 继续添加其他字段...
+    
+    -- 元数据
+    MAX(LogDateTime) AS OperationDateTime,
+    MAX(CASE WHEN LogColumn = 'LogHostName' AND ValueType = 'NEW' THEN FieldValue END) AS LogHostName,
+    MAX(CASE WHEN LogColumn = 'LogUserName' AND ValueType = 'NEW' THEN FieldValue END) AS LogUserName
 FROM InstrumentLogs
-WHERE rn = 1  -- 取每个字段的最新记录
-GROUP BY Instrument, Market
-ORDER BY Instrument, Market
+WHERE rn = 1  -- 取每个类型的最新记录
+GROUP BY InstrumentCode, Market, LogDateTime
+ORDER BY InstrumentCode, Market, LogDateTime DESC
