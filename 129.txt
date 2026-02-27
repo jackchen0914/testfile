@@ -1,232 +1,84 @@
-WITH AllOperations AS (
-    -- INSERT 操作：一条记录
-    SELECT 
-        SeqNo,
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        'NEW' AS ChangeType,
-        LogColumn,
-        AfterValue AS FieldValue
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'INSERT'
-        AND AfterValue IS NOT NULL
+@Mapper
+public interface InstrumentVersionMapper {
     
-    UNION ALL
+    // 批量插入InstrumentVersion
+    void batchInsert(@Param("list") List<InstrumentVersion> list);
     
-    -- UPDATE 操作：两条记录（OLD 和 NEW）
-    SELECT 
-        SeqNo,
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        'OLD' AS ChangeType,
-        LogColumn,
-        BeforeValue AS FieldValue
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'UPDATE'
-        AND BeforeValue IS NOT NULL
+    // 查询所有Instrument变更日志
+    List<GenericLog> selectInstrumentLogs();
     
-    UNION ALL
+    // 根据条件查询特定Instrument的变更日志
+    List<GenericLog> selectInstrumentLogsByKeys(@Param("instrument") String instrument, 
+                                                 @Param("market") String market);
     
-    SELECT 
-        SeqNo,
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        'NEW' AS ChangeType,
-        LogColumn,
-        AfterValue AS FieldValue
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'UPDATE'
-        AND AfterValue IS NOT NULL
-)
-SELECT 
-    SeqNo,
-    InstrumentCode,
-    Market,
-    LogDateTime,
-    LogAction,
-    ChangeType,
-    LogColumn,
-    FieldValue
-FROM AllOperations
-ORDER BY InstrumentCode, Market, LogDateTime DESC, SeqNo DESC, LogColumn
-555555555555555
-WITH UpdatePairs AS (
-    SELECT 
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogColumn,
-        BeforeValue AS OldValue,
-        AfterValue AS NewValue,
-        LogUserName,
-        LogHostName,
-        ROW_NUMBER() OVER (
-            PARTITION BY TableKey1, TableKey2, LogColumn, LogDateTime
-            ORDER BY SeqNo
-        ) AS rn
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'UPDATE'
-        AND (BeforeValue IS NOT NULL OR AfterValue IS NOT NULL)
-),
-InsertValues AS (
-    SELECT 
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogColumn,
-        NULL AS OldValue,
-        AfterValue AS NewValue,
-        LogUserName,
-        LogHostName
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'INSERT'
-        AND AfterValue IS NOT NULL
-)
-SELECT 
-    InstrumentCode,
-    Market,
-    LogDateTime,
-    LogColumn,
-    OldValue,
-    NewValue,
-    CASE 
-        WHEN OldValue IS NULL AND NewValue IS NOT NULL THEN 'INSERT'
-        ELSE 'UPDATE'
-    END AS OperationType,
-    LogUserName,
-    LogHostName
-FROM (
-    SELECT * FROM UpdatePairs WHERE rn = 1
-    UNION ALL
-    SELECT * FROM InsertValues
-) t
-ORDER BY InstrumentCode, Market, LogDateTime DESC, LogColumn
+    // 查询指定时间范围内的变更日志
+    List<GenericLog> selectInstrumentLogsByTimeRange(@Param("startTime") LocalDateTime startTime,
+                                                      @Param("endTime") LocalDateTime endTime);
+}
 
-555555555555555555555
-WITH InstrumentLogs AS (
-    -- 处理 INSERT 操作：生成一条记录（新值）
-    SELECT 
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        LogColumn,
-        'NEW' AS ValueType,  -- 标识是新值
-        AfterValue AS FieldValue,  -- INSERT 取 AfterValue
-        SeqNo,
-        ROW_NUMBER() OVER (
-            PARTITION BY TableKey1, TableKey2, LogColumn, 'NEW'
-            ORDER BY LogDateTime DESC, SeqNo DESC
-        ) AS rn
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'INSERT'
-        AND AfterValue IS NOT NULL
-    
-    UNION ALL
-    
-    -- 处理 UPDATE 操作：生成两条记录（旧值和新值）
-    -- 旧值记录
-    SELECT 
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        LogColumn,
-        'OLD' AS ValueType,
-        BeforeValue AS FieldValue,
-        SeqNo,
-        ROW_NUMBER() OVER (
-            PARTITION BY TableKey1, TableKey2, LogColumn, 'OLD'
-            ORDER BY LogDateTime DESC, SeqNo DESC
-        ) AS rn
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'UPDATE'
-        AND BeforeValue IS NOT NULL
-    
-    UNION ALL
-    
-    -- 新值记录
-    SELECT 
-        TableKey1 AS InstrumentCode,
-        TableKey2 AS Market,
-        LogDateTime,
-        LogAction,
-        LogColumn,
-        'NEW' AS ValueType,
-        AfterValue AS FieldValue,
-        SeqNo,
-        ROW_NUMBER() OVER (
-            PARTITION BY TableKey1, TableKey2, LogColumn, 'NEW'
-            ORDER BY LogDateTime DESC, SeqNo DESC
-        ) AS rn
-    FROM GenericLog
-    WHERE LogTable = 'Instrument' 
-        AND LogAction = 'UPDATE'
-        AND AfterValue IS NOT NULL
-)
-SELECT 
-    InstrumentCode,
-    Market,
-    -- 基础字段
-    MAX(CASE WHEN LogColumn = 'Instrument' AND ValueType = 'NEW' THEN FieldValue END) AS Instrument_New,
-    MAX(CASE WHEN LogColumn = 'Instrument' AND ValueType = 'OLD' THEN FieldValue END) AS Instrument_Old,
-    
-    MAX(CASE WHEN LogColumn = 'Market' AND ValueType = 'NEW' THEN FieldValue END) AS Market_New,
-    MAX(CASE WHEN LogColumn = 'Market' AND ValueType = 'OLD' THEN FieldValue END) AS Market_Old,
-    
-    MAX(CASE WHEN LogColumn = 'Name' AND ValueType = 'NEW' THEN FieldValue END) AS Name_New,
-    MAX(CASE WHEN LogColumn = 'Name' AND ValueType = 'OLD' THEN FieldValue END) AS Name_Old,
-    
-    MAX(CASE WHEN LogColumn = 'ShortName' AND ValueType = 'NEW' THEN FieldValue END) AS ShortName_New,
-    MAX(CASE WHEN LogColumn = 'ShortName' AND ValueType = 'OLD' THEN FieldValue END) AS ShortName_Old,
-    
-    MAX(CASE WHEN LogColumn = 'CName' AND ValueType = 'NEW' THEN FieldValue END) AS CName_New,
-    MAX(CASE WHEN LogColumn = 'CName' AND ValueType = 'OLD' THEN FieldValue END) AS CName_Old,
-    
-    MAX(CASE WHEN LogColumn = 'CShortName' AND ValueType = 'NEW' THEN FieldValue END) AS CShortName_New,
-    MAX(CASE WHEN LogColumn = 'CShortName' AND ValueType = 'OLD' THEN FieldValue END) AS CShortName_Old,
-    
-    MAX(CASE WHEN LogColumn = 'InstrumentClass' AND ValueType = 'NEW' THEN FieldValue END) AS InstrumentClass_New,
-    MAX(CASE WHEN LogColumn = 'InstrumentClass' AND ValueType = 'OLD' THEN FieldValue END) AS InstrumentClass_Old,
-    
-    MAX(CASE WHEN LogColumn = 'ProdCode' AND ValueType = 'NEW' THEN FieldValue END) AS ProdCode_New,
-    MAX(CASE WHEN LogColumn = 'ProdCode' AND ValueType = 'OLD' THEN FieldValue END) AS ProdCode_Old,
-    
-    MAX(CASE WHEN LogColumn = 'LotSize' AND ValueType = 'NEW' THEN FieldValue END) AS LotSize_New,
-    MAX(CASE WHEN LogColumn = 'LotSize' AND ValueType = 'OLD' THEN FieldValue END) AS LotSize_Old,
-    
-    MAX(CASE WHEN LogColumn = 'Price' AND ValueType = 'NEW' THEN FieldValue END) AS Price_New,
-    MAX(CASE WHEN LogColumn = 'Price' AND ValueType = 'OLD' THEN FieldValue END) AS Price_Old,
-    
-    MAX(CASE WHEN LogColumn = 'TransactionValueLimit' AND ValueType = 'NEW' THEN FieldValue END) AS TransactionValueLimit_New,
-    MAX(CASE WHEN LogColumn = 'TransactionValueLimit' AND ValueType = 'OLD' THEN FieldValue END) AS TransactionValueLimit_Old,
-    
-    MAX(CASE WHEN LogColumn = 'ExpiryDate' AND ValueType = 'NEW' THEN FieldValue END) AS ExpiryDate_New,
-    MAX(CASE WHEN LogColumn = 'ExpiryDate' AND ValueType = 'OLD' THEN FieldValue END) AS ExpiryDate_Old,
-    
-    MAX(CASE WHEN LogColumn = 'Active' AND ValueType = 'NEW' THEN FieldValue END) AS Active_New,
-    MAX(CASE WHEN LogColumn = 'Active' AND ValueType = 'OLD' THEN FieldValue END) AS Active_Old,
-    
-    -- 继续添加其他字段...
-    
-    -- 元数据
-    MAX(LogDateTime) AS OperationDateTime,
-    MAX(CASE WHEN LogColumn = 'LogHostName' AND ValueType = 'NEW' THEN FieldValue END) AS LogHostName,
-    MAX(CASE WHEN LogColumn = 'LogUserName' AND ValueType = 'NEW' THEN FieldValue END) AS LogUserName
-FROM InstrumentLogs
-WHERE rn = 1  -- 取每个类型的最新记录
-GROUP BY InstrumentCode, Market, LogDateTime
-ORDER BY InstrumentCode, Market, LogDateTime DESC
+<!-- 批量插入 -->
+    <insert id="batchInsert" parameterType="list">
+        INSERT INTO instrumentVersion (
+            date, instrument, market, name, shortName, cName, cShortName,
+            instrumentClass, prodCode, lotSize, price, transactionValueLimit,
+            transactionQtyLimit, dailyValueLimit, dailyQtyLimit, expiryDate,
+            active, marginPercent, series, priceCap, calculationPrice, suspended,
+            tradingCCY, exchangeCode, exchangeInternalCode, bloomberg, reuter,
+            isin, sedol, firstDealingDate, lastDealingDate, electronicClearing,
+            shortSell, parValue, fee1, fee2, fee3, fee4, fee5, fee6, fee7, fee8,
+            fee9, fee10, category, spreadTableCode, statusFlag, instrumentType,
+            dateOfListed, illiquidCollateralCalculation, syncRef, underMarket,
+            underStock, suspendFrom, lastSuspendPrice, instDepotCode, instLocation,
+            navDate, collateralRatio, interestRateCategory, noBuy, noSell,
+            sellOnlyByCSC, globalInstrumentType, idcInstrumentType, tier,
+            logDateTime, logHostName, logUserName
+        ) VALUES 
+        <foreach collection="list" item="item" separator=",">
+            (#{item.date}, #{item.instrument}, #{item.market}, #{item.name},
+             #{item.shortName}, #{item.cName}, #{item.cShortName},
+             #{item.instrumentClass}, #{item.prodCode}, #{item.lotSize},
+             #{item.price}, #{item.transactionValueLimit}, #{item.transactionQtyLimit},
+             #{item.dailyValueLimit}, #{item.dailyQtyLimit}, #{item.expiryDate},
+             #{item.active}, #{item.marginPercent}, #{item.series},
+             #{item.priceCap}, #{item.calculationPrice}, #{item.suspended},
+             #{item.tradingCCY}, #{item.exchangeCode}, #{item.exchangeInternalCode},
+             #{item.bloomberg}, #{item.reuter}, #{item.isin}, #{item.sedol},
+             #{item.firstDealingDate}, #{item.lastDealingDate},
+             #{item.electronicClearing}, #{item.shortSell}, #{item.parValue},
+             #{item.fee1}, #{item.fee2}, #{item.fee3}, #{item.fee4}, #{item.fee5},
+             #{item.fee6}, #{item.fee7}, #{item.fee8}, #{item.fee9}, #{item.fee10},
+             #{item.category}, #{item.spreadTableCode}, #{item.statusFlag},
+             #{item.instrumentType}, #{item.dateOfListed},
+             #{item.illiquidCollateralCalculation}, #{item.syncRef},
+             #{item.underMarket}, #{item.underStock}, #{item.suspendFrom},
+             #{item.lastSuspendPrice}, #{item.instDepotCode}, #{item.instLocation},
+             #{item.navDate}, #{item.collateralRatio}, #{item.interestRateCategory},
+             #{item.noBuy}, #{item.noSell}, #{item.sellOnlyByCSC},
+             #{item.globalInstrumentType}, #{item.idcInstrumentType}, #{item.tier},
+             #{item.logDateTime}, #{item.logHostName}, #{item.logUserName})
+        </foreach>
+    </insert>
+
+    <!-- 查询所有Instrument日志 -->
+    <select id="selectInstrumentLogs" resultType="com.yourpackage.entity.GenericLog">
+        SELECT * FROM GenericLog 
+        WHERE LogTable = 'Instrument' 
+        ORDER BY TableKey1, TableKey2, LogDateTime, SeqNo
+    </select>
+
+    <!-- 根据主键查询 -->
+    <select id="selectInstrumentLogsByKeys" resultType="com.yourpackage.entity.GenericLog">
+        SELECT * FROM GenericLog 
+        WHERE LogTable = 'Instrument' 
+        AND TableKey1 = #{instrument}
+        AND TableKey2 = #{market}
+        ORDER BY LogDateTime, SeqNo
+    </select>
+
+    <!-- 按时间范围查询 -->
+    <select id="selectInstrumentLogsByTimeRange" resultType="com.yourpackage.entity.GenericLog">
+        SELECT * FROM GenericLog 
+        WHERE LogTable = 'Instrument' 
+        AND LogDateTime BETWEEN #{startTime} AND #{endTime}
+        ORDER BY TableKey1, TableKey2, LogDateTime, SeqNo
+    </select>
