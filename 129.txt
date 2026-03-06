@@ -1,71 +1,80 @@
-package org.example.batch.listener;
+package org.example.batch.writer;
 
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.example.mapper.McConvEvntMapper;
+import org.example.mapper.McCeventMapper;
+import org.example.pojo.McConvEvntPO;
+import org.example.pojo.McCeventPO;
 import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.service.CaRSCMasterDataService;
-import org.springframework.batch.core.ItemWriteListener;
+import org.example.utils.DataBaseOperationUtils;
+import org.springframework.batch.item.ItemWriter;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
-/**
- * CaRSC写入监听器
- * 在Writer完成oracle写入后，通过监听器写入master数据源
- * 避免在同一个事务中混用两个数据源
- */
 @Component
-@Slf4j
 @RequiredArgsConstructor
-public class CaRSCWriteListener implements ItemWriteListener<CaRSCResultDTO> {
+public class CaRSCOracleWriter implements ItemWriter<CaRSCResultDTO> {
 
-    private final CaRSCMasterDataService caRSCMasterDataService;
-    
-    // 使用ThreadLocal存储当前批次的数据
-    private final ThreadLocal<List<CaRSCResultDTO>> currentItems = new ThreadLocal<>();
+    private static final int BATCH_SIZE = 1000;
 
-    @Override
-    public void beforeWrite(List<? extends CaRSCResultDTO> items) {
-        log.info("CaRSCWriteListener.beforeWrite called with {} items", items.size());
-        currentItems.set((List<CaRSCResultDTO>) items);
-    }
+    private final McCeventMapper mcCeventMapper;
+    private final McConvEvntMapper mcConvEvntMapper;
 
     @Override
-    public void afterWrite(List<? extends CaRSCResultDTO> items) {
-        log.info("CaRSCWriteListener.afterWrite called with {} items", items.size());
-        try {
-            // Writer的oracle事务已经提交，现在可以安全地写入master数据源
-            List<CaRSCResultDTO> itemList = currentItems.get();
-            if (itemList != null && !itemList.isEmpty()) {
-                log.info("Calling saveMasterDataFromItems with {} items", itemList.size());
-                caRSCMasterDataService.saveMasterDataFromItems(itemList);
-                log.info("Successfully saved master data");
-            } else {
-                log.warn("No items to save to master database");
-            }
-        } catch (Exception e) {
-            log.error("Error saving master data", e);
-            throw e;
-        } finally {
-            currentItems.remove();
+    @Transactional(rollbackFor = Exception.class)
+    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
+        if(items.isEmpty()){
+            return;
         }
-    }
 
-    @Override
-    public void onWriteError(Exception exception, List<? extends CaRSCResultDTO> items) {
-        currentItems.remove();
-        log.error("Write error occurred", exception);
+        List<McConvEvntPO> rightsRecord = new ArrayList<>();
+        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();
+        List<McConvEvntPO> splitRecord = new ArrayList<>();
+        List<McCeventPO> splitDetailsRecord = new ArrayList<>();
+        List<McConvEvntPO> consolidRecord = new ArrayList<>();
+        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();
+
+        for (CaRSCResultDTO dto : items){
+            if(Objects.equals(dto.getTableFlag(), "rights")){
+                rightsRecord.add(dto.getMainRecord());
+                rightsDetailsRecord.add(dto.getDetailRecord());
+            }
+            if(Objects.equals(dto.getTableFlag(), "split")){
+                splitRecord.add(dto.getMainRecord());
+                splitDetailsRecord.add(dto.getDetailRecord());
+            }
+            if(Objects.equals(dto.getTableFlag(), "consolidation")){
+                consolidRecord.add(dto.getMainRecord());
+                consolidDetailsRecord.add(dto.getDetailRecord());
+            }
+        }
+
+        DataBaseOperationUtils.batchInsertFrom(rightsRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(splitRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(consolidRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+
+        rightsRecord.clear();
+        rightsDetailsRecord.clear();
+        splitRecord.clear();
+        splitDetailsRecord.clear();
+        consolidRecord.clear();
+        consolidDetailsRecord.clear();
     }
 }
 
 
 
 
-package org.example.service;
+package org.example.batch.writer;
 
-import com.baomidou.dynamic.datasource.annotation.DS;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.example.mapper.DivAnnCombineMapMSSEMapper;
 import org.example.mapper.DivAnnRightsMapMSSEMapper;
 import org.example.mapper.DivAnnSplitMapMSSEMapper;
@@ -73,61 +82,35 @@ import org.example.pojo.DivAnnCombineMapMSSEPO;
 import org.example.pojo.DivAnnRightsMapMSSEPO;
 import org.example.pojo.DivAnnSplitMapMSSEPO;
 import org.example.pojo.dtos.CaRSCResultDTO;
-import org.springframework.stereotype.Service;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-/**
- * CaRSC Master数据源写入服务
- * 在独立的方法中操作master数据源
- */
-@Service
-@Slf4j
+@Component
 @RequiredArgsConstructor
-public class CaRSCMasterDataService {
+public class CaRSCMasterWriter implements ItemWriter<CaRSCResultDTO> {
 
     private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
     private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
     private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
 
-    @DS("master")
+    @Override
     @Transactional(rollbackFor = Exception.class)
-    public void saveMasterData(List<DivAnnRightsMapMSSEPO> rightsMapList,
-                                List<DivAnnSplitMapMSSEPO> splitMapList,
-                                List<DivAnnCombineMapMSSEPO> combineMapList) {
-        log.info("saveMasterData called - rights: {}, split: {}, combine: {}", 
-                rightsMapList != null ? rightsMapList.size() : 0,
-                splitMapList != null ? splitMapList.size() : 0,
-                combineMapList != null ? combineMapList.size() : 0);
-        
-        if (rightsMapList != null && !rightsMapList.isEmpty()) {
-            log.info("Inserting {} rights records", rightsMapList.size());
-            divAnnRightsMapMSSEMapper.insert(rightsMapList);
+    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
+        if(items.isEmpty()){
+            return;
         }
-        if (splitMapList != null && !splitMapList.isEmpty()) {
-            log.info("Inserting {} split records", splitMapList.size());
-            divAnnSplitMapMSSEMapper.insert(splitMapList);
-        }
-        if (combineMapList != null && !combineMapList.isEmpty()) {
-            log.info("Inserting {} combine records", combineMapList.size());
-            divAnnCombineMapMSSEMapper.insert(combineMapList);
-        }
-        log.info("saveMasterData completed");
-    }
 
-    @DS("master")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveMasterDataFromItems(List<CaRSCResultDTO> items) {
-        log.info("saveMasterDataFromItems called with {} items", items.size());
         List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
         List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
         List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
 
-        for (CaRSCResultDTO dto : items) {
-            if (Objects.equals(dto.getTableFlag(), "rights")) {
+        for (CaRSCResultDTO dto : items){
+            if(Objects.equals(dto.getTableFlag(), "rights")){
                 DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
                 divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
                 divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
@@ -147,7 +130,8 @@ public class CaRSCMasterDataService {
                 divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
                 divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
                 divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            } else if (Objects.equals(dto.getTableFlag(), "split")) {
+            }
+            if(Objects.equals(dto.getTableFlag(), "split")){
                 DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
                 divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
                 divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
@@ -167,7 +151,8 @@ public class CaRSCMasterDataService {
                 divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
                 divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
                 divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            } else if (Objects.equals(dto.getTableFlag(), "consolidation")) {
+            }
+            if(Objects.equals(dto.getTableFlag(), "consolidation")){
                 DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
                 divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
                 divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
@@ -190,11 +175,16 @@ public class CaRSCMasterDataService {
             }
         }
 
-        log.info("Prepared data - rights: {}, split: {}, combine: {}", 
-                divAnnRightsMapMSSEPOList.size(), 
-                divAnnSplitMapMSSEPOList.size(), 
-                divAnnCombineMapMSSEPOList.size());
-        saveMasterData(divAnnRightsMapMSSEPOList, divAnnSplitMapMSSEPOList, divAnnCombineMapMSSEPOList);
-        log.info("saveMasterDataFromItems completed successfully");
+        divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
+        divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
+        divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
+
+        divAnnRightsMapMSSEPOList.clear();
+        divAnnSplitMapMSSEPOList.clear();
+        divAnnCombineMapMSSEPOList.clear();
     }
 }
+
+
+
+
