@@ -1,3 +1,50 @@
+@Autowired
+    private CaRSCProcessor caRSCProcessor;
+
+    @Autowired
+    private CaRSCReader caRSCReader;
+
+    @Autowired
+    private CaRSCOracleWriter caRSCOracleWriter;
+
+    @Autowired
+    private CaRSCMasterWriter caRSCMasterWriter;
+
+    @Bean
+    public Step caRSCOracleMigrationStep(){
+        return stepBuilderFactory.get("caRSCOracleMigrationStep")
+                .<CaRSCDTO, CaRSCResultDTO>chunk(1000)
+                .reader(caRSCReader)
+                .processor(caRSCProcessor)
+                .writer(caRSCOracleWriter)
+                .faultTolerant()
+                .skipLimit(3)
+                .skip(Exception.class)
+                .build();
+    }
+
+    @Bean
+    public Step caRSCMasterMigrationStep(){
+        return stepBuilderFactory.get("caRSCMasterMigrationStep")
+                .<CaRSCDTO, CaRSCResultDTO>chunk(1000)
+                .reader(caRSCReader)
+                .processor(caRSCProcessor)
+                .writer(caRSCMasterWriter)
+                .faultTolerant()
+                .skipLimit(3)
+                .skip(Exception.class)
+                .build();
+    }
+
+    @Bean
+    public Job caRSCFeeMigrationJob(){
+        return jobBuilderFactory.get("caRSCFeeMigrationJob")
+                .incrementer(new RunIdIncrementer())
+                .start(caRSCOracleMigrationStep())
+                .next(caRSCMasterMigrationStep())
+                .build();
+    }
+
 package org.example.batch.writer;
 
 import lombok.RequiredArgsConstructor;
