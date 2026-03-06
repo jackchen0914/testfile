@@ -7,9 +7,13 @@ import org.example.pojo.*;
 import org.example.pojo.dtos.CaRSCResultDTO;
 import org.example.utils.DataBaseOperationUtils;
 import org.springframework.batch.item.ItemWriter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.DefaultTransactionDefinition;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -26,6 +30,10 @@ public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
     private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
     private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
     private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
+    
+    @Autowired
+    @Qualifier("transactionManager")
+    private PlatformTransactionManager transactionManager;
 
     @Override
     public void write(List<? extends CaRSCResultDTO> items) throws Exception {
@@ -116,9 +124,52 @@ public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
             }
         }
 
-        // 写入 Oracle 和 Master
-        saveToOracle(rightsRecord, rightsDetailsRecord, splitRecord, splitDetailsRecord, consolidRecord, consolidDetailsRecord);
-        saveToMaster(divAnnRightsMapMSSEPOList, divAnnSplitMapMSSEPOList, divAnnCombineMapMSSEPOList);
+        // 写入 Oracle - 使用编程式事务
+        DefaultTransactionDefinition oracleDef = new DefaultTransactionDefinition();
+        oracleDef.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        TransactionStatus oracleStatus = transactionManager.getTransaction(oracleDef);
+        try {
+            DynamicDataSourceContextHolder.push("oracle");
+            try {
+                DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(rightsRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(splitRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(consolidRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
+            } finally {
+                DynamicDataSourceContextHolder.poll();
+            }
+            transactionManager.commit(oracleStatus);
+        } catch (Exception e) {
+            transactionManager.rollback(oracleStatus);
+            throw e;
+        }
+
+        // 写入 Master - 使用编程式事务
+        DefaultTransactionDefinition masterDef = new DefaultTransactionDefinition();
+        masterDef.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        TransactionStatus masterStatus = transactionManager.getTransaction(masterDef);
+        try {
+            DynamicDataSourceContextHolder.push("master");
+            try {
+                if (!divAnnRightsMapMSSEPOList.isEmpty()) {
+                    divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
+                }
+                if (!divAnnSplitMapMSSEPOList.isEmpty()) {
+                    divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
+                }
+                if (!divAnnCombineMapMSSEPOList.isEmpty()) {
+                    divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
+                }
+            } finally {
+                DynamicDataSourceContextHolder.poll();
+            }
+            transactionManager.commit(masterStatus);
+        } catch (Exception e) {
+            transactionManager.rollback(masterStatus);
+            throw e;
+        }
 
         rightsRecord.clear();
         rightsDetailsRecord.clear();
@@ -129,42 +180,5 @@ public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
         divAnnRightsMapMSSEPOList.clear();
         divAnnSplitMapMSSEPOList.clear();
         divAnnCombineMapMSSEPOList.clear();
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void saveToOracle(List<McConvEvntPO> rightsRecord, List<McCeventPO> rightsDetailsRecord,
-                             List<McConvEvntPO> splitRecord, List<McCeventPO> splitDetailsRecord,
-                             List<McConvEvntPO> consolidRecord, List<McCeventPO> consolidDetailsRecord) {
-        DynamicDataSourceContextHolder.push("oracle");
-        try {
-            DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-            DataBaseOperationUtils.batchInsertFrom(rightsRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-            DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-            DataBaseOperationUtils.batchInsertFrom(splitRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-            DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-            DataBaseOperationUtils.batchInsertFrom(consolidRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-        } finally {
-            DynamicDataSourceContextHolder.poll();
-        }
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void saveToMaster(List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList,
-                             List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList,
-                             List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList) {
-        DynamicDataSourceContextHolder.push("master");
-        try {
-            if (!divAnnRightsMapMSSEPOList.isEmpty()) {
-                divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
-            }
-            if (!divAnnSplitMapMSSEPOList.isEmpty()) {
-                divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
-            }
-            if (!divAnnCombineMapMSSEPOList.isEmpty()) {
-                divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
-            }
-        } finally {
-            DynamicDataSourceContextHolder.poll();
-        }
     }
 }
