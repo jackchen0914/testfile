@@ -1,49 +1,8 @@
-2026-03-06 18:51:05 [main] INFO  o.s.b.a.l.ConditionEvaluationReportLoggingListener - 
-
-Error starting ApplicationContext. To display the conditions report re-run your application with 'debug' enabled.
-2026-03-06 18:51:05 [main] ERROR o.s.boot.SpringApplication - Application run failed
-org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'customBatchConfigurer': Invocation of init method failed; nested exception is org.springframework.batch.core.configuration.BatchConfigurationException: java.lang.IllegalArgumentException: TransactionManager must not be null.
-	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor.postProcessBeforeInitialization(InitDestroyAnnotationBeanPostProcessor.java:160)
-	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.applyBeanPostProcessorsBeforeInitialization(AbstractAutowireCapableBeanFactory.java:440)
-	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.initializeBean(AbstractAutowireCapableBeanFactory.java:1796)
-	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.doCreateBean(AbstractAutowireCapableBeanFactory.java:620)
-	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBean(AbstractAutowireCapableBeanFactory.java:542)
-	at org.springframework.beans.factory.support.AbstractBeanFactory.lambda$doGetBean$0(AbstractBeanFactory.java:335)
-	at org.springframework.beans.factory.support.DefaultSingletonBeanRegistry.getSingleton(DefaultSingletonBeanRegistry.java:234)
-	at org.springframework.beans.factory.support.AbstractBeanFactory.doGetBean(AbstractBeanFactory.java:333)
-	at org.springframework.beans.factory.support.AbstractBeanFactory.getBean(AbstractBeanFactory.java:208)
-	at org.springframework.beans.factory.support.DefaultListableBeanFactory.preInstantiateSingletons(DefaultListableBeanFactory.java:955)
-	at org.springframework.context.support.AbstractApplicationContext.finishBeanFactoryInitialization(AbstractApplicationContext.java:929)
-	at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:591)
-	at org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext.refresh(ServletWebServerApplicationContext.java:147)
-	at org.springframework.boot.SpringApplication.refresh(SpringApplication.java:732)
-	at org.springframework.boot.SpringApplication.refreshContext(SpringApplication.java:409)
-	at org.springframework.boot.SpringApplication.run(SpringApplication.java:308)
-	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1300)
-	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1289)
-	at org.example.DataMigrationApplication.main(DataMigrationApplication.java:25)
-Caused by: org.springframework.batch.core.configuration.BatchConfigurationException: java.lang.IllegalArgumentException: TransactionManager must not be null.
-	at org.springframework.batch.core.configuration.annotation.DefaultBatchConfigurer.initialize(DefaultBatchConfigurer.java:119)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
-	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
-	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor$LifecycleElement.invoke(InitDestroyAnnotationBeanPostProcessor.java:389)
-	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor$LifecycleMetadata.invokeInitMethods(InitDestroyAnnotationBeanPostProcessor.java:333)
-	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor.postProcessBeforeInitialization(InitDestroyAnnotationBeanPostProcessor.java:157)
-	... 18 common frames omitted
-Caused by: java.lang.IllegalArgumentException: TransactionManager must not be null.
-	at org.springframework.util.Assert.notNull(Assert.java:201)
-	at org.springframework.batch.core.repository.support.AbstractJobRepositoryFactoryBean.afterPropertiesSet(AbstractJobRepositoryFactoryBean.java:198)
-	at org.springframework.batch.core.configuration.annotation.DefaultBatchConfigurer.initialize(DefaultBatchConfigurer.java:106)
-	... 25 common frames omitted
-Disconnected from the target VM, address: '127.0.0.1:57896', transport: 'socket'
-
-
-
 package org.example.config;
 
 import org.springframework.batch.core.configuration.annotation.DefaultBatchConfigurer;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.repository.support.JobRepositoryFactoryBean;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.stereotype.Component;
@@ -54,18 +13,38 @@ import javax.sql.DataSource;
 @Component
 public class CustomBatchConfigurer extends DefaultBatchConfigurer {
 
+    private DataSource dataSource;
     private PlatformTransactionManager transactionManager;
+    private JobRepository jobRepository;
 
     @Override
     public void setDataSource(DataSource dataSource) {
-        DataSource h2DataSource = DataSourceBuilder.create()
+        this.dataSource = DataSourceBuilder.create()
                 .driverClassName("org.h2.Driver")
                 .url("jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE")
                 .username("sa")
                 .password("")
                 .build();
-        this.transactionManager = new DataSourceTransactionManager(h2DataSource);
-        super.setDataSource(h2DataSource);
+        this.transactionManager = new DataSourceTransactionManager(this.dataSource);
+    }
+
+    @Override
+    protected void initialize() {
+        try {
+            JobRepositoryFactoryBean factory = new JobRepositoryFactoryBean();
+            factory.setDataSource(this.dataSource);
+            factory.setTransactionManager(this.transactionManager);
+            factory.setIsolationLevelForCreate("ISOLATION_SERIALIZABLE");
+            factory.afterPropertiesSet();
+            this.jobRepository = factory.getObject();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize Spring Batch", e);
+        }
+    }
+
+    @Override
+    public JobRepository getJobRepository() {
+        return this.jobRepository;
     }
 
     @Override
@@ -73,363 +52,3 @@ public class CustomBatchConfigurer extends DefaultBatchConfigurer {
         return this.transactionManager;
     }
 }
-
-
-package org.example.service.impl;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.DivAnnCombineMapMSSEMapper;
-import org.example.mapper.DivAnnRightsMapMSSEMapper;
-import org.example.mapper.DivAnnSplitMapMSSEMapper;
-import org.example.pojo.DivAnnCombineMapMSSEPO;
-import org.example.pojo.DivAnnRightsMapMSSEPO;
-import org.example.pojo.DivAnnSplitMapMSSEPO;
-import org.example.service.CaRSCMasterDataService;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-public class CaRSCMasterDataServiceImpl implements CaRSCMasterDataService {
-
-    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
-    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
-    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
-
-    @Override
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertDivAnnRightsMap(List<DivAnnRightsMapMSSEPO> list) {
-        if (list != null && !list.isEmpty()) {
-            divAnnRightsMapMSSEMapper.insert(list);
-        }
-    }
-
-    @Override
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertDivAnnSplitMap(List<DivAnnSplitMapMSSEPO> list) {
-        if (list != null && !list.isEmpty()) {
-            divAnnSplitMapMSSEMapper.insert(list);
-        }
-    }
-
-    @Override
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertDivAnnCombineMap(List<DivAnnCombineMapMSSEPO> list) {
-        if (list != null && !list.isEmpty()) {
-            divAnnCombineMapMSSEMapper.insert(list);
-        }
-    }
-}
-
-
-
-package org.example.batch.writer;
-
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.*;
-import org.example.pojo.*;
-import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.service.CaRSCMasterDataService;
-import org.example.service.CaRSCOracleInsertService;
-import org.example.utils.DataBaseOperationUtils;
-import org.springframework.batch.item.ItemWriter;
-import org.springframework.stereotype.Component;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
-@Component
-@RequiredArgsConstructor
-public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
-
-    private final CaRSCOracleInsertService caRSCOracleInsertService;
-    private final CaRSCMasterDataService caRSCMasterDataService;
-
-    @Override
-    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
-        if(items.isEmpty()){
-            return;
-        }
-
-        List<McConvEvntPO> rightsRecord = new ArrayList<>();
-        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> splitRecord = new ArrayList<>();
-        List<McCeventPO> splitDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> consolidRecord = new ArrayList<>();
-        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();
-
-        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
-        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
-        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
-
-        for (CaRSCResultDTO dto : items){
-            if(Objects.equals(dto.getTableFlag(), "rights")){
-                rightsRecord.add(dto.getMainRecord());
-                rightsDetailsRecord.add(dto.getDetailRecord());
-                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
-                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
-                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
-                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
-                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
-                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "split")){
-                splitRecord.add(dto.getMainRecord());
-                splitDetailsRecord.add(dto.getDetailRecord());
-                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
-                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
-                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
-                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
-                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
-                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "consolidation")){
-                consolidRecord.add(dto.getMainRecord());
-                consolidDetailsRecord.add(dto.getDetailRecord());
-                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
-                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
-                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
-                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
-                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
-                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
-            }
-        }
-
-        caRSCOracleInsertService.insertToOracle(rightsRecord, rightsDetailsRecord, splitRecord, splitDetailsRecord, consolidRecord, consolidDetailsRecord);
-
-        caRSCMasterDataService.insertDivAnnRightsMap(divAnnRightsMapMSSEPOList);
-        caRSCMasterDataService.insertDivAnnSplitMap(divAnnSplitMapMSSEPOList);
-        caRSCMasterDataService.insertDivAnnCombineMap(divAnnCombineMapMSSEPOList);
-
-        rightsRecord.clear();
-        rightsDetailsRecord.clear();
-        splitRecord.clear();
-        splitDetailsRecord.clear();
-        consolidRecord.clear();
-        consolidDetailsRecord.clear();
-        divAnnRightsMapMSSEPOList.clear();
-        divAnnSplitMapMSSEPOList.clear();
-        divAnnCombineMapMSSEPOList.clear();
-    }
-}
-
-
-
-package org.example.service.impl;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.McCeventMapper;
-import org.example.mapper.McConvEvntMapper;
-import org.example.pojo.McCeventPO;
-import org.example.pojo.McConvEvntPO;
-import org.example.service.CaRSCOracleInsertService;
-import org.example.utils.DataBaseOperationUtils;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-public class CaRSCOracleInsertServiceImpl implements CaRSCOracleInsertService {
-
-    private static final int BATCH_SIZE = 1000;
-
-    private final McCeventMapper mcCeventMapper;
-    private final McConvEvntMapper mcConvEvntMapper;
-
-    @Override
-    @DS("oracle")
-    @Transactional(rollbackFor = Exception.class)
-    public void insertToOracle(List<McConvEvntPO> rightsRecord, List<McCeventPO> rightsDetailsRecord,
-                                List<McConvEvntPO> splitRecord, List<McCeventPO> splitDetailsRecord,
-                                List<McConvEvntPO> consolidRecord, List<McCeventPO> consolidDetailsRecord) {
-        DataBaseOperationUtils.batchInsertFrom(rightsRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(splitRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(consolidRecord, mcConvEvntMapper::batchInsert, BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord, mcCeventMapper::batchInsert, BATCH_SIZE);
-    }
-}
-
-
-
-package org.example.batch.writer;
-
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.*;
-import org.example.pojo.*;
-import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.service.CaRSCMasterDataService;
-import org.example.service.CaRSCOracleInsertService;
-import org.example.utils.DataBaseOperationUtils;
-import org.springframework.batch.item.ItemWriter;
-import org.springframework.stereotype.Component;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
-@Component
-@RequiredArgsConstructor
-public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
-
-    private final CaRSCOracleInsertService caRSCOracleInsertService;
-    private final CaRSCMasterDataService caRSCMasterDataService;
-
-    @Override
-    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
-        if(items.isEmpty()){
-            return;
-        }
-
-        List<McConvEvntPO> rightsRecord = new ArrayList<>();
-        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> splitRecord = new ArrayList<>();
-        List<McCeventPO> splitDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> consolidRecord = new ArrayList<>();
-        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();
-
-        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
-        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
-        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
-
-        for (CaRSCResultDTO dto : items){
-            if(Objects.equals(dto.getTableFlag(), "rights")){
-                rightsRecord.add(dto.getMainRecord());
-                rightsDetailsRecord.add(dto.getDetailRecord());
-                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
-                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
-                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
-                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
-                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
-                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "split")){
-                splitRecord.add(dto.getMainRecord());
-                splitDetailsRecord.add(dto.getDetailRecord());
-                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
-                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
-                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
-                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
-                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
-                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "consolidation")){
-                consolidRecord.add(dto.getMainRecord());
-                consolidDetailsRecord.add(dto.getDetailRecord());
-                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
-                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
-                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
-                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
-                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
-                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
-            }
-        }
-
-        caRSCOracleInsertService.insertToOracle(rightsRecord, rightsDetailsRecord, splitRecord, splitDetailsRecord, consolidRecord, consolidDetailsRecord);
-
-        caRSCMasterDataService.insertDivAnnRightsMap(divAnnRightsMapMSSEPOList);
-        caRSCMasterDataService.insertDivAnnSplitMap(divAnnSplitMapMSSEPOList);
-        caRSCMasterDataService.insertDivAnnCombineMap(divAnnCombineMapMSSEPOList);
-
-        rightsRecord.clear();
-        rightsDetailsRecord.clear();
-        splitRecord.clear();
-        splitDetailsRecord.clear();
-        consolidRecord.clear();
-        consolidDetailsRecord.clear();
-        divAnnRightsMapMSSEPOList.clear();
-        divAnnSplitMapMSSEPOList.clear();
-        divAnnCombineMapMSSEPOList.clear();
-    }
-}
-
