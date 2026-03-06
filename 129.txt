@@ -1,120 +1,30 @@
-package org.example.service;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.DivAnnCombineMapMSSEMapper;
-import org.example.mapper.DivAnnRightsMapMSSEMapper;
-import org.example.mapper.DivAnnSplitMapMSSEMapper;
-import org.example.pojo.DivAnnCombineMapMSSEPO;
-import org.example.pojo.DivAnnRightsMapMSSEPO;
-import org.example.pojo.DivAnnSplitMapMSSEPO;
-import org.example.pojo.dtos.CaRSCResultDTO;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
-/**
- * CaRSC Master数据源写入服务
- * 在独立的方法中操作master数据源
- */
-@Service
-@RequiredArgsConstructor
-public class CaRSCMasterDataService {
-
-    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
-    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
-    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
-
-    @DS("master")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveMasterData(List<DivAnnRightsMapMSSEPO> rightsMapList,
-                                List<DivAnnSplitMapMSSEPO> splitMapList,
-                                List<DivAnnCombineMapMSSEPO> combineMapList) {
-        if (rightsMapList != null && !rightsMapList.isEmpty()) {
-            divAnnRightsMapMSSEMapper.insert(rightsMapList);
-        }
-        if (splitMapList != null && !splitMapList.isEmpty()) {
-            divAnnSplitMapMSSEMapper.insert(splitMapList);
-        }
-        if (combineMapList != null && !combineMapList.isEmpty()) {
-            divAnnCombineMapMSSEMapper.insert(combineMapList);
-        }
-    }
-
-    @DS("master")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveMasterDataFromItems(List<CaRSCResultDTO> items) {
-        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
-        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
-        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
-
-        for (CaRSCResultDTO dto : items) {
-            if (Objects.equals(dto.getTableFlag(), "rights")) {
-                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
-                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
-                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
-                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
-                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
-                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            } else if (Objects.equals(dto.getTableFlag(), "split")) {
-                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
-                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
-                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
-                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
-                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
-                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            } else if (Objects.equals(dto.getTableFlag(), "consolidation")) {
-                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
-                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
-                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
-                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
-                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
-                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
-            }
-        }
-
-        saveMasterData(divAnnRightsMapMSSEPOList, divAnnSplitMapMSSEPOList, divAnnCombineMapMSSEPOList);
-    }
-}
+Releasing transactional SqlSession [org.apache.ibatis.session.defaults.DefaultSqlSession@5f1c661d]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.c.s.item.ChunkOrientedTasklet - Inputs not busy, ended: true
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.core.step.tasklet.TaskletStep - Applying contribution: [StepContribution: read=0, written=1, filtered=0, readSkips=0, writeSkips=0, processSkips=0, exitStatus=EXECUTING]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Participating in existing transaction
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.core.step.tasklet.TaskletStep - Saving step execution before commit: StepExecution: id=1, version=9, name=caRSCtMigrationStep, status=STARTED, exitStatus=EXECUTING, readCount=10, filterCount=0, writeCount=9 readSkipCount=0, writeSkipCount=0, processSkipCount=1, commitCount=9, rollbackCount=2, exitDescription=
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Participating in existing transaction
+Transaction synchronization committing SqlSession [org.apache.ibatis.session.defaults.DefaultSqlSession@5f1c661d]
+Transaction synchronization deregistering SqlSession [org.apache.ibatis.session.defaults.DefaultSqlSession@5f1c661d]
+Transaction synchronization closing SqlSession [org.apache.ibatis.session.defaults.DefaultSqlSession@5f1c661d]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Initiating transaction commit
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Committing resourceless transaction on [org.springframework.batch.support.transaction.ResourcelessTransactionManager$ResourcelessTransaction@297b97a]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.repeat.support.RepeatTemplate - Repeat is complete according to policy and result value.
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.batch.core.step.AbstractStep - Step execution success: id=1
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Creating new transaction with name [org.springframework.batch.core.repository.support.SimpleJobRepository.updateExecutionContext]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Initiating transaction commit
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Committing resourceless transaction on [org.springframework.batch.support.transaction.ResourcelessTransactionManager$ResourcelessTransaction@465c189d]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] INFO  o.s.batch.core.step.AbstractStep - Step: [caRSCtMigrationStep] executed in 1s923ms
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Creating new transaction with name [org.springframework.batch.core.repository.support.SimpleJobRepository.update]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Initiating transaction commit
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Committing resourceless transaction on [org.springframework.batch.support.transaction.ResourcelessTransactionManager$ResourcelessTransaction@26443921]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.batch.core.step.AbstractStep - Step execution complete: StepExecution: id=1, version=11, name=caRSCtMigrationStep, status=COMPLETED, exitStatus=COMPLETED, readCount=10, filterCount=0, writeCount=9 readSkipCount=0, writeSkipCount=0, processSkipCount=1, commitCount=9, rollbackCount=2
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Creating new transaction with name [org.springframework.batch.core.repository.support.SimpleJobRepository.updateExecutionContext]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Initiating transaction commit
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Committing resourceless transaction on [org.springframework.batch.support.transaction.ResourcelessTransactionManager$ResourcelessTransaction@3da89c6a]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.batch.core.job.AbstractJob - Upgrading JobExecution status: StepExecution: id=1, version=11, name=caRSCtMigrationStep, status=COMPLETED, exitStatus=COMPLETED, readCount=10, filterCount=0, writeCount=9 readSkipCount=0, writeSkipCount=0, processSkipCount=1, commitCount=9, rollbackCount=2, exitDescription=
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.batch.core.job.AbstractJob - Job execution complete: JobExecution: id=0, version=1, startTime=Fri Mar 06 16:25:08 CST 2026, endTime=null, lastUpdated=Fri Mar 06 16:25:08 CST 2026, status=COMPLETED, exitStatus=exitCode=COMPLETED;exitDescription=, job=[JobInstance: id=0, version=0, Job=[caRSCFeeMigrationJob]], jobParameters=[{timestamp=1772785508838}]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Creating new transaction with name [org.springframework.batch.core.repository.support.SimpleJobRepository.update]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Initiating transaction commit
+2026-03-06 16:25:10 [http-nio-8088-exec-1] DEBUG o.s.b.s.t.ResourcelessTransactionManager - Committing resourceless transaction on [org.springframework.batch.support.transaction.ResourcelessTransactionManager$ResourcelessTransaction@6dda2d91]
+2026-03-06 16:25:10 [http-nio-8088-exec-1] INFO  o.s.b.c.l.support.SimpleJobLauncher - Job: [SimpleJob: [name=caRSCFeeMigrationJob]] completed with the following parameters: [{timestamp=1772785508838}] and the following status: [COMPLETED] in 1s950ms
