@@ -1,355 +1,230 @@
- // 所有Instrument相关字段列表（根据field1-4.png整理）
-    private static final Set<String> INSTRUMENT_FIELDS = new HashSet<>(Arrays.asList(
-        "Instrument", "Market", "Name", "ShortName", "CName", "CShortName",
-        "InstrumentClass", "ProdCode", "LotSize", "Price", "TransactionValueLimit",
-        "TransactionQtyLimit", "DailyValueLimit", "DailyQtyLimit", "ExpiryDate",
-        "Active", "MarginPercent", "Series", "PriceCap", "CalculationPrice",
-        "Suspended", "TradingCCY", "ExchangeCode", "ExchangeInternalCode",
-        "Bloomberg", "Reuter", "ISIN", "Sedol", "FirstDealingDate",
-        "LastDealingDate", "ElectronicClearing", "ShortSell", "ParValue",
-        "Fee1", "Fee2", "Fee3", "Fee4", "Fee5", "Fee6", "Fee7", "Fee8",
-        "Fee9", "Fee10", "Category", "SpreadTableCode", "StatusFlag",
-        "InstrumentType", "DateOfListed", "IlliquidCollateralCalculation",
-        "SyncRef", "UnderMarket", "UnderStock", "SuspendFrom", "LastSuspendPrice",
-        "InstDepotCode", "InstLocation", "NAVDate", "CollateralRatio",
-        "InterestRateCategory", "NoBuy", "NoSell", "SellOnlyByCSC",
-        "GlobalInstrumentType", "IDCInstrumentType", "Tier"
-    ));
+package org.example.batch.writer;
+
+import com.baomidou.dynamic.datasource.annotation.DS;
+import com.baomidou.dynamic.datasource.toolkit.DynamicDataSourceContextHolder;
+import lombok.RequiredArgsConstructor;
+import org.example.mapper.*;
+import org.example.pojo.*;
+import org.example.pojo.dtos.CaRSCResultDTO;
+import org.example.pojo.dtos.FeeMigrationResultDTO;
+import org.example.utils.DataBaseOperationUtils;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+
+@Component
+@RequiredArgsConstructor
+public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
+
+    private static final int BATCH_SIZE = 1000;
+
+    private final McCeventMapper mcCeventMapper;
+    private final McConvEvntMapper mcConvEvntMapper;
+    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
+    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
+    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
+
+    private final PlatformTransactionManager transactionManager;
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
-    public void buildInstrumentVersion() {
-        log.info("开始构建InstrumentVersion数据...");
-        
-        // 1. 查询所有Instrument日志
-        List<GenericLog> allLogs = instrumentVersionMapper.selectInstrumentLogs();
-        if (allLogs.isEmpty()) {
-            log.info("未找到Instrument日志记录");
+    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
+        if(items.isEmpty()){
             return;
         }
         
-        log.info("共查询到 {} 条Instrument日志记录", allLogs.size());
+        // 关键：设置事务传播行为为 REQUIRES_NEW，挂起外层 Spring Batch 事务
+        TransactionTemplate oracleTransaction = new TransactionTemplate(transactionManager);
+        oracleTransaction.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
         
-        // 2. 按Instrument+Market+LogDateTime分组
-        Map<String, List<GenericLog>> groupedLogs = groupLogsByInstrumentAndTime(allLogs);
+        TransactionTemplate masterTransaction = new TransactionTemplate(transactionManager);
+        masterTransaction.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
         
-        // 3. 构建InstrumentVersion记录
-        List<InstrumentVersion> versionList = new ArrayList<>();
-        
-        for (Map.Entry<String, List<GenericLog>> entry : groupedLogs.entrySet()) {
+        List<McConvEvntPO> rightsRecord = new ArrayList<>();
+        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();//rights
+        List<McConvEvntPO> splitRecord = new ArrayList<>();
+        List<McCeventPO> splitDetailsRecord = new ArrayList<>();//split
+        List<McConvEvntPO> consolidRecord = new ArrayList<>();
+        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();//consolidation
+
+        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
+        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
+        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
+
+        for (CaRSCResultDTO dto : items){
+            if(Objects.equals(dto.getTableFlag(), "rights")){
+                rightsRecord.add(dto.getMainRecord());
+                rightsDetailsRecord.add(dto.getDetailRecord());
+                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
+                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
+                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
+                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
+                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
+                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
+                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
+            }
+            if(Objects.equals(dto.getTableFlag(), "split")){
+                splitRecord.add(dto.getMainRecord());
+                splitDetailsRecord.add(dto.getDetailRecord());
+                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
+                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
+                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
+                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
+                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
+                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
+                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
+            }
+            if(Objects.equals(dto.getTableFlag(), "consolidation")){
+                consolidRecord.add(dto.getMainRecord());
+                consolidDetailsRecord.add(dto.getDetailRecord());
+                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
+                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
+                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
+                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
+                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
+                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
+                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
+            }
+        }
+
+        // 第一个独立事务：写入 Oracle
+        oracleTransaction.execute(status -> {
+            DynamicDataSourceContextHolder.push("oracle");
             try {
-                InstrumentVersion version = buildVersionFromLogs(entry.getValue());
-                if (version != null) {
-                    versionList.add(version);
+                DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+                DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+            } finally {
+                DynamicDataSourceContextHolder.poll();
+            }
+            return null;
+        });
+        
+        // 第二个独立事务：写入 Master
+        masterTransaction.execute(status -> {
+            DynamicDataSourceContextHolder.push("master");
+            try {
+                if (!divAnnRightsMapMSSEPOList.isEmpty()) {
+                    divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
                 }
-            } catch (Exception e) {
-                log.error("处理日志组 {} 时发生错误", entry.getKey(), e);
+                if (!divAnnSplitMapMSSEPOList.isEmpty()) {
+                    divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
+                }
+                if (!divAnnCombineMapMSSEPOList.isEmpty()) {
+                    divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
+                }
+            } finally {
+                DynamicDataSourceContextHolder.poll();
             }
-        }
-        
-        // 4. 批量插入
-        if (!versionList.isEmpty()) {
-            instrumentVersionMapper.batchInsert(versionList);
-            log.info("成功插入 {} 条InstrumentVersion记录", versionList.size());
-        }
-    }
-
-    /**
-     * 按Instrument、Market和LogDateTime分组
-     * 同一时间点的变更归为一组
-     */
-    private Map<String, List<GenericLog>> groupLogsByInstrumentAndTime(List<GenericLog> logs) {
-        return logs.stream()
-            .filter(log -> INSTRUMENT_FIELDS.contains(log.getLogColumn()))
-            .collect(Collectors.groupingBy(log -> 
-                log.getTableKey1() + "|" + 
-                log.getTableKey2() + "|" + 
-                log.getLogDateTime().toString()
-            ));
-    }
-
-    /**
-     * 从一组日志构建InstrumentVersion对象
-     */
-    private InstrumentVersion buildVersionFromLogs(List<GenericLog> logs) {
-        if (logs == null || logs.isEmpty()) {
             return null;
-        }
+        });
 
-        InstrumentVersion version = new InstrumentVersion();
-        GenericLog firstLog = logs.get(0);
-        
-        // 设置基础信息
-        version.setInstrument(firstLog.getTableKey1());
-        version.setMarket(firstLog.getTableKey2());
-        version.setLogDateTime(firstLog.getLogDateTime());
-        version.setLogHostName(firstLog.getLogHostName());
-        version.setLogUserName(firstLog.getLogUserName());
-        
-        // 按LogAction分类处理
-        Map<String, List<GenericLog>> actionGroups = logs.stream()
-            .collect(Collectors.groupingBy(GenericLog::getLogAction));
-        
-        // 处理INSERT记录
-        List<GenericLog> insertLogs = actionGroups.get("INSERT");
-        if (insertLogs != null && !insertLogs.isEmpty()) {
-            processInsertLogs(version, insertLogs);
-        }
-        
-        // 处理UPDATE记录
-        List<GenericLog> updateLogs = actionGroups.get("UPDATE");
-        if (updateLogs != null && !updateLogs.isEmpty()) {
-            processUpdateLogs(version, updateLogs);
-        }
-        
-        return version;
+        rightsRecord.clear();
+        rightsDetailsRecord.clear();
+        splitRecord.clear();
+        splitDetailsRecord.clear();
+        consolidRecord.clear();
+        consolidDetailsRecord.clear();
+        divAnnRightsMapMSSEPOList.clear();
+        divAnnSplitMapMSSEPOList.clear();
+        divAnnCombineMapMSSEPOList.clear();// 内存回收
     }
 
-    /**
-     * 处理INSERT类型的日志
-     */
-    private void processInsertLogs(InstrumentVersion version, List<GenericLog> insertLogs) {
-        for (GenericLog log : insertLogs) {
-            setFieldValue(version, log.getLogColumn(), log.getAfterValue());
-        }
-    }
+//    @Transactional(propagation = Propagation.REQUIRES_NEW)
+//    @DS("oracle")
+//    private void saveToOracle(List<McConvEvntPO> rightsRecord, List<McCeventPO> rightsDetailsRecord, List<McConvEvntPO> splitRecord, List<McCeventPO> splitDetailsRecord, List<McConvEvntPO> consolidRecord, List<McCeventPO> consolidDetailsRecord){
+//        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+//        DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+//        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+//        DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+//        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+//        DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+//    }
+//
+//    @Transactional(propagation = Propagation.REQUIRES_NEW)
+//    @DS("master")
+//    private void saveToMaster(List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList, List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList, List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList){
+//        if(!divAnnRightsMapMSSEPOList.isEmpty()){
+//            divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
+//        }
+//        if(!divAnnSplitMapMSSEPOList.isEmpty()){
+//            divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
+//        }
+//        if(!divAnnCombineMapMSSEPOList.isEmpty()){
+//            divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
+//        }
+//
+//    }
 
-    /**
-     * 处理UPDATE类型的日志
-     * UPDATE日志中，AfterValue是更新后的值
-     */
-    private void processUpdateLogs(InstrumentVersion version, List<GenericLog> updateLogs) {
-        for (GenericLog log : updateLogs) {
-            setFieldValue(version, log.getLogColumn(), log.getAfterValue());
-        }
-    }
-
-    /**
-     * 根据字段名设置值
-     */
-    private void setFieldValue(InstrumentVersion version, String fieldName, String value) {
-        if (value == null || "NULL".equals(value) || "[NULL]".equals(value)) {
-            return;
-        }
-
-        try {
-            switch (fieldName) {
-                case "Date":
-                case "date":
-                    version.setDate(parseLocalDateTime(value));
-                    break;
-                case "Instrument":
-                    version.setInstrument(value);
-                    break;
-                case "Market":
-                    version.setMarket(value);
-                    break;
-                case "Name":
-                    version.setName(value);
-                    break;
-                case "ShortName":
-                    version.setShortName(value);
-                    break;
-                case "CName":
-                    version.setCName(value);
-                    break;
-                case "CShortName":
-                    version.setCShortName(value);
-                    break;
-                case "InstrumentClass":
-                    version.setInstrumentClass(value);
-                    break;
-                case "ProdCode":
-                    version.setProdCode(value);
-                    break;
-                case "LotSize":
-                    version.setLotSize(new BigDecimal(value));
-                    break;
-                case "Price":
-                    version.setPrice(new BigDecimal(value));
-                    break;
-                case "TransactionValueLimit":
-                    version.setTransactionValueLimit(new BigDecimal(value));
-                    break;
-                case "TransactionQtyLimit":
-                    version.setTransactionQtyLimit(new BigDecimal(value));
-                    break;
-                case "DailyValueLimit":
-                    version.setDailyValueLimit(new BigDecimal(value));
-                    break;
-                case "DailyQtyLimit":
-                    version.setDailyQtyLimit(new BigDecimal(value));
-                    break;
-                case "ExpiryDate":
-                    version.setExpiryDate(parseDate(value));
-                    break;
-                case "Active":
-                    version.setActive(value);
-                    break;
-                case "MarginPercent":
-                    version.setMarginPercent(new BigDecimal(value));
-                    break;
-                case "Series":
-                    version.setSeries(value);
-                    break;
-                case "PriceCap":
-                    version.setPriceCap(new BigDecimal(value));
-                    break;
-                case "CalculationPrice":
-                    version.setCalculationPrice(new BigDecimal(value));
-                    break;
-                case "Suspended":
-                    version.setSuspended(value);
-                    break;
-                case "TradingCCY":
-                    version.setTradingCCY(value);
-                    break;
-                case "ExchangeCode":
-                    version.setExchangeCode(value);
-                    break;
-                case "ExchangeInternalCode":
-                    version.setExchangeInternalCode(value);
-                    break;
-                case "Bloomberg":
-                    version.setBloomberg(value);
-                    break;
-                case "Reuter":
-                    version.setReuter(value);
-                    break;
-                case "ISIN":
-                    version.setIsin(value);
-                    break;
-                case "Sedol":
-                    version.setSedol(value);
-                    break;
-                case "FirstDealingDate":
-                    version.setFirstDealingDate(parseDate(value));
-                    break;
-                case "LastDealingDate":
-                    version.setLastDealingDate(parseDate(value));
-                    break;
-                case "ElectronicClearing":
-                    version.setElectronicClearing(value);
-                    break;
-                case "ShortSell":
-                    version.setShortSell(value);
-                    break;
-                case "ParValue":
-                    version.setParValue(new BigDecimal(value));
-                    break;
-                case "Fee1": case "Fee2": case "Fee3": case "Fee4": case "Fee5":
-                case "Fee6": case "Fee7": case "Fee8": case "Fee9": case "Fee10":
-                    setFeeValue(version, fieldName, value);
-                    break;
-                case "Category":
-                    version.setCategory(value);
-                    break;
-                case "SpreadTableCode":
-                    version.setSpreadTableCode(value);
-                    break;
-                case "StatusFlag":
-                    version.setStatusFlag(value);
-                    break;
-                case "InstrumentType":
-                    version.setInstrumentType(value);
-                    break;
-                case "DateOfListed":
-                    version.setDateOfListed(parseDate(value));
-                    break;
-                case "IlliquidCollateralCalculation":
-                    version.setIlliquidCollateralCalculation(value);
-                    break;
-                case "SyncRef":
-                    version.setSyncRef(value);
-                    break;
-                case "UnderMarket":
-                    version.setUnderMarket(value);
-                    break;
-                case "UnderStock":
-                    version.setUnderStock(value);
-                    break;
-                case "SuspendFrom":
-                    version.setSuspendFrom(parseDate(value));
-                    break;
-                case "LastSuspendPrice":
-                    version.setLastSuspendPrice(new BigDecimal(value));
-                    break;
-                case "InstDepotCode":
-                    version.setInstDepotCode(value);
-                    break;
-                case "InstLocation":
-                    version.setInstLocation(value);
-                    break;
-                case "NAVDate":
-                    version.setNavDate(parseDate(value));
-                    break;
-                case "CollateralRatio":
-                    version.setCollateralRatio(new BigDecimal(value));
-                    break;
-                case "InterestRateCategory":
-                    version.setInterestRateCategory(value);
-                    break;
-                case "NoBuy":
-                    version.setNoBuy(value);
-                    break;
-                case "NoSell":
-                    version.setNoSell(value);
-                    break;
-                case "SellOnlyByCSC":
-                    version.setSellOnlyByCSC(value);
-                    break;
-                case "GlobalInstrumentType":
-                    version.setGlobalInstrumentType(value);
-                    break;
-                case "IDCInstrumentType":
-                    version.setIdcInstrumentType(value);
-                    break;
-                case "Tier":
-                    version.setTier(value);
-                    break;
-                default:
-                    log.debug("忽略未知字段: {}", fieldName);
-            }
-        } catch (Exception e) {
-            log.error("设置字段值失败: field={}, value={}", fieldName, value, e);
-        }
-    }
-
-    private void setFeeValue(InstrumentVersion version, String feeField, String value) {
-        switch (feeField) {
-            case "Fee1": version.setFee1(value); break;
-            case "Fee2": version.setFee2(value); break;
-            case "Fee3": version.setFee3(value); break;
-            case "Fee4": version.setFee4(value); break;
-            case "Fee5": version.setFee5(value); break;
-            case "Fee6": version.setFee6(value); break;
-            case "Fee7": version.setFee7(value); break;
-            case "Fee8": version.setFee8(value); break;
-            case "Fee9": version.setFee9(value); break;
-            case "Fee10": version.setFee10(value); break;
-        }
-    }
-
-    private LocalDateTime parseLocalDateTime(String dateStr) {
-        if (!StringUtils.hasText(dateStr)) return null;
-        try {
-            // 处理 "2025-10-21 00:00:00" 格式
-            return LocalDateTime.parse(dateStr.replace(" ", "T"));
-        } catch (Exception e) {
-            log.warn("日期解析失败: {}", dateStr);
-            return null;
-        }
-    }
-
-    private Date parseDate(String dateStr) {
-        if (!StringUtils.hasText(dateStr) || "NULL".equals(dateStr) || "[NULL]".equals(dateStr)) {
-            return null;
-        }
-        try {
-            // 处理 "2022-07-08 00:00:00" 格式
-            return java.sql.Timestamp.valueOf(dateStr);
-        } catch (Exception e) {
-            log.warn("日期解析失败: {}", dateStr);
-            return null;
-        }
-    }
+//    private void batchInsertDetailRecords(List<McCeventPO> detailsRecord) {
+//        if(detailsRecord.isEmpty()){
+//            return;
+//        }
+//
+//        for (int i = 0; i < detailsRecord.size(); i+=BATCH_SIZE) {
+//            int end = Math.min(i+BATCH_SIZE,detailsRecord.size());
+//            List<McCeventPO> mcCeventPOList = detailsRecord.subList(i, end);
+//            mcCeventMapper.batchInsert(mcCeventPOList);
+//        }
+//    }
+//
+//    private void batchInsertMainRecords(List<McConvEvntPO> mainRecord) {
+//
+//        if(mainRecord.isEmpty()){
+//            return;
+//        }
+//
+//        for (int i = 0; i < mainRecord.size(); i+=BATCH_SIZE) {
+//            int end = Math.min(i+BATCH_SIZE,mainRecord.size());
+//            List<McConvEvntPO> mcConvEvntPOList = mainRecord.subList(i, end);
+//            mcConvEvntMapper.batchInsert(mcConvEvntPOList);
+//        }
+//
+//    }
+}
