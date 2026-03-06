@@ -1,3 +1,66 @@
+package org.example.batch.listener;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.example.pojo.dtos.CaRSCResultDTO;
+import org.example.service.CaRSCMasterDataService;
+import org.springframework.batch.core.ItemWriteListener;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+/**
+ * CaRSC写入监听器
+ * 在Writer完成oracle写入后，通过监听器写入master数据源
+ * 避免在同一个事务中混用两个数据源
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class CaRSCWriteListener implements ItemWriteListener<CaRSCResultDTO> {
+
+    private final CaRSCMasterDataService caRSCMasterDataService;
+    
+    // 使用ThreadLocal存储当前批次的数据
+    private final ThreadLocal<List<CaRSCResultDTO>> currentItems = new ThreadLocal<>();
+
+    @Override
+    public void beforeWrite(List<? extends CaRSCResultDTO> items) {
+        log.info("CaRSCWriteListener.beforeWrite called with {} items", items.size());
+        currentItems.set((List<CaRSCResultDTO>) items);
+    }
+
+    @Override
+    public void afterWrite(List<? extends CaRSCResultDTO> items) {
+        log.info("CaRSCWriteListener.afterWrite called with {} items", items.size());
+        try {
+            // Writer的oracle事务已经提交，现在可以安全地写入master数据源
+            List<CaRSCResultDTO> itemList = currentItems.get();
+            if (itemList != null && !itemList.isEmpty()) {
+                log.info("Calling saveMasterDataFromItems with {} items", itemList.size());
+                caRSCMasterDataService.saveMasterDataFromItems(itemList);
+                log.info("Successfully saved master data");
+            } else {
+                log.warn("No items to save to master database");
+            }
+        } catch (Exception e) {
+            log.error("Error saving master data", e);
+            throw e;
+        } finally {
+            currentItems.remove();
+        }
+    }
+
+    @Override
+    public void onWriteError(Exception exception, List<? extends CaRSCResultDTO> items) {
+        currentItems.remove();
+        log.error("Write error occurred", exception);
+    }
+}
+
+
+
+
 package org.example.service;
 
 import com.baomidou.dynamic.datasource.annotation.DS;
