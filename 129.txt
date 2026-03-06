@@ -1,12 +1,13 @@
 package org.example.config;
 
-import org.springframework.batch.core.configuration.BatchConfigurer;
 import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.explore.support.JobExplorerFactoryBean;
 import org.springframework.batch.core.launch.JobLauncher;
 import org.springframework.batch.core.launch.support.SimpleJobLauncher;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.repository.support.JobRepositoryFactoryBean;
 import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -14,53 +15,43 @@ import org.springframework.transaction.PlatformTransactionManager;
 import javax.sql.DataSource;
 
 @Configuration
-public class CustomBatchConfigurer implements BatchConfigurer {
+public class CustomBatchConfigurer {
 
-    private DataSource dataSource;
-    private PlatformTransactionManager transactionManager;
-    private JobRepository jobRepository;
-    private JobLauncher jobLauncher;
-    private JobExplorer jobExplorer;
-
-    public CustomBatchConfigurer() {
-        this.dataSource = DataSourceBuilder.create()
+    @Bean
+    public DataSource batchDataSource() {
+        return DataSourceBuilder.create()
                 .driverClassName("org.h2.Driver")
                 .url("jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE")
                 .username("sa")
                 .password("")
                 .build();
-        this.transactionManager = new DataSourceTransactionManager(dataSource);
-        try {
-            JobRepositoryFactoryBean factory = new JobRepositoryFactoryBean();
-            factory.setDataSource(dataSource);
-            factory.setTransactionManager(transactionManager);
-            factory.setIsolationLevelForCreate("ISOLATION_SERIALIZABLE");
-            factory.afterPropertiesSet();
-            this.jobRepository = factory.getObject();
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize Spring Batch JobRepository", e);
-        }
-        this.jobLauncher = new SimpleJobLauncher(jobRepository);
-        this.jobExplorer = new JobExplorer(dataSource, transactionManager);
     }
 
-    @Override
-    public JobRepository getJobRepository() {
-        return jobRepository;
+    @Bean
+    public PlatformTransactionManager batchTransactionManager(DataSource batchDataSource) {
+        return new DataSourceTransactionManager(batchDataSource);
     }
 
-    @Override
-    public PlatformTransactionManager getTransactionManager() {
-        return transactionManager;
+    @Bean
+    public JobRepository jobRepository(DataSource batchDataSource, PlatformTransactionManager batchTransactionManager) throws Exception {
+        JobRepositoryFactoryBean factory = new JobRepositoryFactoryBean();
+        factory.setDataSource(batchDataSource);
+        factory.setTransactionManager(batchTransactionManager);
+        factory.setIsolationLevelForCreate("ISOLATION_SERIALIZABLE");
+        factory.afterPropertiesSet();
+        return factory.getObject();
     }
 
-    @Override
-    public JobLauncher getJobLauncher() {
-        return jobLauncher;
+    @Bean
+    public JobLauncher jobLauncher(JobRepository jobRepository) {
+        return new SimpleJobLauncher(jobRepository);
     }
 
-    @Override
-    public JobExplorer getJobExplorer() {
-        return jobExplorer;
+    @Bean
+    public JobExplorer jobExplorer(DataSource batchDataSource, PlatformTransactionManager batchTransactionManager) throws Exception {
+        JobExplorerFactoryBean factory = new JobExplorerFactoryBean();
+        factory.setDataSource(batchDataSource);
+        factory.afterPropertiesSet();
+        return factory.getObject();
     }
 }
