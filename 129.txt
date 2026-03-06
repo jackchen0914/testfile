@@ -1,230 +1,108 @@
-package org.example.batch.writer;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import com.baomidou.dynamic.datasource.toolkit.DynamicDataSourceContextHolder;
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.*;
-import org.example.pojo.*;
-import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.pojo.dtos.FeeMigrationResultDTO;
-import org.example.utils.DataBaseOperationUtils;
-import org.springframework.batch.item.ItemWriter;
-import org.springframework.stereotype.Component;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
-
-import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
-@Component
-@RequiredArgsConstructor
-public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
-
-    private static final int BATCH_SIZE = 1000;
-
-    private final McCeventMapper mcCeventMapper;
-    private final McConvEvntMapper mcConvEvntMapper;
-    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
-    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
-    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
-
-    private final PlatformTransactionManager transactionManager;
-
-    @Override
-    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
-        if(items.isEmpty()){
-            return;
-        }
-        
-        // 关键：设置事务传播行为为 REQUIRES_NEW，挂起外层 Spring Batch 事务
-        TransactionTemplate oracleTransaction = new TransactionTemplate(transactionManager);
-        oracleTransaction.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
-        
-        TransactionTemplate masterTransaction = new TransactionTemplate(transactionManager);
-        masterTransaction.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
-        
-        List<McConvEvntPO> rightsRecord = new ArrayList<>();
-        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();//rights
-        List<McConvEvntPO> splitRecord = new ArrayList<>();
-        List<McCeventPO> splitDetailsRecord = new ArrayList<>();//split
-        List<McConvEvntPO> consolidRecord = new ArrayList<>();
-        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();//consolidation
-
-        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
-        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
-        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
-
-        for (CaRSCResultDTO dto : items){
-            if(Objects.equals(dto.getTableFlag(), "rights")){
-                rightsRecord.add(dto.getMainRecord());
-                rightsDetailsRecord.add(dto.getDetailRecord());
-                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
-                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
-                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
-                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
-                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
-                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "split")){
-                splitRecord.add(dto.getMainRecord());
-                splitDetailsRecord.add(dto.getDetailRecord());
-                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
-                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
-                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
-                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
-                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
-                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "consolidation")){
-                consolidRecord.add(dto.getMainRecord());
-                consolidDetailsRecord.add(dto.getDetailRecord());
-                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
-                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
-                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
-                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
-                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
-                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
-            }
-        }
-
-        // 第一个独立事务：写入 Oracle
-        oracleTransaction.execute(status -> {
-            DynamicDataSourceContextHolder.push("oracle");
-            try {
-                DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-                DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-                DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-                DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-                DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-                DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-            } finally {
-                DynamicDataSourceContextHolder.poll();
-            }
-            return null;
-        });
-        
-        // 第二个独立事务：写入 Master
-        masterTransaction.execute(status -> {
-            DynamicDataSourceContextHolder.push("master");
-            try {
-                if (!divAnnRightsMapMSSEPOList.isEmpty()) {
-                    divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
-                }
-                if (!divAnnSplitMapMSSEPOList.isEmpty()) {
-                    divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
-                }
-                if (!divAnnCombineMapMSSEPOList.isEmpty()) {
-                    divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
-                }
-            } finally {
-                DynamicDataSourceContextHolder.poll();
-            }
-            return null;
-        });
-
-        rightsRecord.clear();
-        rightsDetailsRecord.clear();
-        splitRecord.clear();
-        splitDetailsRecord.clear();
-        consolidRecord.clear();
-        consolidDetailsRecord.clear();
-        divAnnRightsMapMSSEPOList.clear();
-        divAnnSplitMapMSSEPOList.clear();
-        divAnnCombineMapMSSEPOList.clear();// 内存回收
-    }
-
-//    @Transactional(propagation = Propagation.REQUIRES_NEW)
-//    @DS("oracle")
-//    private void saveToOracle(List<McConvEvntPO> rightsRecord, List<McCeventPO> rightsDetailsRecord, List<McConvEvntPO> splitRecord, List<McCeventPO> splitDetailsRecord, List<McConvEvntPO> consolidRecord, List<McCeventPO> consolidDetailsRecord){
-//        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-//        DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-//        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-//        DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-//        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-//        DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-//    }
-//
-//    @Transactional(propagation = Propagation.REQUIRES_NEW)
-//    @DS("master")
-//    private void saveToMaster(List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList, List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList, List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList){
-//        if(!divAnnRightsMapMSSEPOList.isEmpty()){
-//            divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPOList);
-//        }
-//        if(!divAnnSplitMapMSSEPOList.isEmpty()){
-//            divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPOList);
-//        }
-//        if(!divAnnCombineMapMSSEPOList.isEmpty()){
-//            divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPOList);
-//        }
-//
-//    }
-
-//    private void batchInsertDetailRecords(List<McCeventPO> detailsRecord) {
-//        if(detailsRecord.isEmpty()){
-//            return;
-//        }
-//
-//        for (int i = 0; i < detailsRecord.size(); i+=BATCH_SIZE) {
-//            int end = Math.min(i+BATCH_SIZE,detailsRecord.size());
-//            List<McCeventPO> mcCeventPOList = detailsRecord.subList(i, end);
-//            mcCeventMapper.batchInsert(mcCeventPOList);
-//        }
-//    }
-//
-//    private void batchInsertMainRecords(List<McConvEvntPO> mainRecord) {
-//
-//        if(mainRecord.isEmpty()){
-//            return;
-//        }
-//
-//        for (int i = 0; i < mainRecord.size(); i+=BATCH_SIZE) {
-//            int end = Math.min(i+BATCH_SIZE,mainRecord.size());
-//            List<McConvEvntPO> mcConvEvntPOList = mainRecord.subList(i, end);
-//            mcConvEvntMapper.batchInsert(mcConvEvntPOList);
-//        }
-//
-//    }
-}
+2026-03-06 11:08:55 [http-nio-8088-exec-2] ERROR o.s.batch.core.step.AbstractStep - Encountered an error executing step caRSCtMigrationStep in job caRSCFeeMigrationJob
+org.springframework.transaction.TransactionSuspensionNotSupportedException: Transaction manager [org.springframework.batch.support.transaction.ResourcelessTransactionManager] does not support transaction suspension
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.doSuspend(AbstractPlatformTransactionManager.java:1108)
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.suspend(AbstractPlatformTransactionManager.java:574)
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.handleExistingTransaction(AbstractPlatformTransactionManager.java:432)
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.getTransaction(AbstractPlatformTransactionManager.java:352)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:344)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:198)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at org.springframework.batch.core.configuration.annotation.SimpleBatchConfiguration$PassthruAdvice.invoke(SimpleBatchConfiguration.java:128)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:186)
+	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:241)
+	at com.sun.proxy.$Proxy120.getTransaction(Unknown Source)
+	at org.springframework.transaction.support.TransactionTemplate.execute(TransactionTemplate.java:137)
+	at org.example.batch.writer.CaRSCWriter.write(CaRSCWriter.java:134)
+	at org.springframework.batch.core.step.item.SimpleChunkProcessor.writeItems(SimpleChunkProcessor.java:193)
+	at org.springframework.batch.core.step.item.SimpleChunkProcessor.doWrite(SimpleChunkProcessor.java:159)
+	at org.springframework.batch.core.step.item.FaultTolerantChunkProcessor$3.doWithRetry(FaultTolerantChunkProcessor.java:348)
+	at org.springframework.retry.support.RetryTemplate.doExecute(RetryTemplate.java:329)
+	at org.springframework.retry.support.RetryTemplate.execute(RetryTemplate.java:255)
+	at org.springframework.batch.core.step.item.BatchRetryTemplate.execute(BatchRetryTemplate.java:217)
+	at org.springframework.batch.core.step.item.FaultTolerantChunkProcessor.write(FaultTolerantChunkProcessor.java:444)
+	at org.springframework.batch.core.step.item.SimpleChunkProcessor.process(SimpleChunkProcessor.java:217)
+	at org.springframework.batch.core.step.item.ChunkOrientedTasklet.execute(ChunkOrientedTasklet.java:77)
+	at org.springframework.batch.core.step.tasklet.TaskletStep$ChunkTransactionCallback.doInTransaction(TaskletStep.java:407)
+	at org.springframework.batch.core.step.tasklet.TaskletStep$ChunkTransactionCallback.doInTransaction(TaskletStep.java:331)
+	at org.springframework.transaction.support.TransactionTemplate.execute(TransactionTemplate.java:140)
+	at org.springframework.batch.core.step.tasklet.TaskletStep$2.doInChunkContext(TaskletStep.java:273)
+	at org.springframework.batch.core.scope.context.StepContextRepeatCallback.doInIteration(StepContextRepeatCallback.java:82)
+	at org.springframework.batch.repeat.support.RepeatTemplate.getNextResult(RepeatTemplate.java:382)
+	at org.springframework.batch.repeat.support.RepeatTemplate.executeInternal(RepeatTemplate.java:215)
+	at org.springframework.batch.repeat.support.RepeatTemplate.iterate(RepeatTemplate.java:145)
+	at org.springframework.batch.core.step.tasklet.TaskletStep.doExecute(TaskletStep.java:258)
+	at org.springframework.batch.core.step.AbstractStep.execute(AbstractStep.java:208)
+	at org.springframework.batch.core.job.SimpleStepHandler.handleStep(SimpleStepHandler.java:152)
+	at org.springframework.batch.core.job.AbstractJob.handleStep(AbstractJob.java:413)
+	at org.springframework.batch.core.job.SimpleJob.doExecute(SimpleJob.java:136)
+	at org.springframework.batch.core.job.AbstractJob.execute(AbstractJob.java:320)
+	at org.springframework.batch.core.launch.support.SimpleJobLauncher$1.run(SimpleJobLauncher.java:149)
+	at org.springframework.core.task.SyncTaskExecutor.execute(SyncTaskExecutor.java:50)
+	at org.springframework.batch.core.launch.support.SimpleJobLauncher.run(SimpleJobLauncher.java:140)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:344)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:198)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at org.springframework.batch.core.configuration.annotation.SimpleBatchConfiguration$PassthruAdvice.invoke(SimpleBatchConfiguration.java:128)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:186)
+	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:241)
+	at com.sun.proxy.$Proxy169.run(Unknown Source)
+	at org.example.service.BatchJobService.startCaRSCMigration(BatchJobService.java:55)
+	at org.example.controller.BatchJobController.startCaRSCMigration(BatchJobController.java:23)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:205)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:150)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:117)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:895)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:808)
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1072)
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:965)
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1006)
+	at org.springframework.web.servlet.FrameworkServlet.doGet(FrameworkServlet.java:898)
+	at javax.servlet.http.HttpServlet.service(HttpServlet.java:529)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:883)
+	at javax.servlet.http.HttpServlet.service(HttpServlet.java:623)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:209)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:153)
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:178)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:153)
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:117)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:178)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:153)
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:117)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:178)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:153)
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:117)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:178)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:153)
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:168)
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:481)
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:130)
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74)
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:342)
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:390)
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63)
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:928)
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1794)
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1191)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659)
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:61)
+	at java.base/java.lang.Thread.run(Thread.java:834)
