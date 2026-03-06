@@ -1,50 +1,120 @@
-package org.example.batch.listener;
+package org.example.service;
 
+import com.baomidou.dynamic.datasource.annotation.DS;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.example.mapper.DivAnnCombineMapMSSEMapper;
+import org.example.mapper.DivAnnRightsMapMSSEMapper;
+import org.example.mapper.DivAnnSplitMapMSSEMapper;
+import org.example.pojo.DivAnnCombineMapMSSEPO;
+import org.example.pojo.DivAnnRightsMapMSSEPO;
+import org.example.pojo.DivAnnSplitMapMSSEPO;
 import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.service.CaRSCMasterDataService;
-import org.springframework.batch.core.ItemWriteListener;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
- * CaRSC写入监听器
- * 在Writer完成oracle写入后，通过监听器写入master数据源
- * 避免在同一个事务中混用两个数据源
+ * CaRSC Master数据源写入服务
+ * 在独立的方法中操作master数据源
  */
-@Component
-@Slf4j
+@Service
 @RequiredArgsConstructor
-public class CaRSCWriteListener implements ItemWriteListener<CaRSCResultDTO> {
+public class CaRSCMasterDataService {
 
-    private final CaRSCMasterDataService caRSCMasterDataService;
-    
-    // 使用ThreadLocal存储当前批次的数据
-    private final ThreadLocal<List<CaRSCResultDTO>> currentItems = new ThreadLocal<>();
+    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
+    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
+    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
 
-    @Override
-    public void beforeWrite(List<? extends CaRSCResultDTO> items) {
-        currentItems.set((List<CaRSCResultDTO>) items);
-    }
-
-    @Override
-    public void afterWrite(List<? extends CaRSCResultDTO> items) {
-        try {
-            // Writer的oracle事务已经提交，现在可以安全地写入master数据源
-            List<CaRSCResultDTO> itemList = currentItems.get();
-            if (itemList != null && !itemList.isEmpty()) {
-                caRSCMasterDataService.saveMasterDataFromItems(itemList);
-            }
-        } finally {
-            currentItems.remove();
+    @DS("master")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveMasterData(List<DivAnnRightsMapMSSEPO> rightsMapList,
+                                List<DivAnnSplitMapMSSEPO> splitMapList,
+                                List<DivAnnCombineMapMSSEPO> combineMapList) {
+        if (rightsMapList != null && !rightsMapList.isEmpty()) {
+            divAnnRightsMapMSSEMapper.insert(rightsMapList);
+        }
+        if (splitMapList != null && !splitMapList.isEmpty()) {
+            divAnnSplitMapMSSEMapper.insert(splitMapList);
+        }
+        if (combineMapList != null && !combineMapList.isEmpty()) {
+            divAnnCombineMapMSSEMapper.insert(combineMapList);
         }
     }
 
-    @Override
-    public void onWriteError(Exception exception, List<? extends CaRSCResultDTO> items) {
-        currentItems.remove();
-        log.error("Write error occurred", exception);
+    @DS("master")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveMasterDataFromItems(List<CaRSCResultDTO> items) {
+        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
+        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
+        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
+
+        for (CaRSCResultDTO dto : items) {
+            if (Objects.equals(dto.getTableFlag(), "rights")) {
+                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
+                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
+                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
+                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
+                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
+                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
+                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
+            } else if (Objects.equals(dto.getTableFlag(), "split")) {
+                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
+                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
+                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
+                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
+                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
+                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
+                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
+            } else if (Objects.equals(dto.getTableFlag(), "consolidation")) {
+                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
+                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
+                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
+                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
+                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
+                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
+                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
+            }
+        }
+
+        saveMasterData(divAnnRightsMapMSSEPOList, divAnnSplitMapMSSEPOList, divAnnCombineMapMSSEPOList);
     }
 }
