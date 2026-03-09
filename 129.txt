@@ -1,246 +1,185 @@
-package org.example.batch.processor;
+package org.example.batch.writer;
 
-import com.baomidou.dynamic.datasource.annotation.DS;
-import com.baomidou.dynamic.datasource.toolkit.DynamicDataSourceContextHolder;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.example.mapper.*;
 import org.example.pojo.*;
-import org.example.pojo.dtos.CaRSCDTO;
 import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.service.IdGeneratorService;
-import org.example.service.MasterDataService;
-import org.example.utils.PropertyConverUtils;
-import org.springframework.batch.item.ItemProcessor;
+import org.example.utils.DataBaseOperationUtils;
+import org.springframework.batch.item.ItemWriter;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.CollectionUtils;
 
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 @Component
-@Slf4j
 @RequiredArgsConstructor
-public class CaRSCProcessor implements ItemProcessor<CaRSCDTO, CaRSCResultDTO> {
+public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
 
-    private final McMrktMapper mcMrktMapper;
-    private final IdGeneratorService idGeneratorService;
-    private final McInstrMapper mcInstrMapper;
-    private final MasterDataService masterDataService;
+    private static final int BATCH_SIZE = 1000;
 
-    @Override
-    @DS("oracle")
-    @Transactional(rollbackFor = Exception.class)
-    public CaRSCResultDTO process(CaRSCDTO caRSCDTO) throws Exception {
-        if(caRSCDTO == null){
-            return null;
-        }
-
-        CaRSCResultDTO result = new CaRSCResultDTO();
-
-        Long mainId = idGeneratorService.generateMainId();
-
-        McCeventPO mcCeventPO = new McCeventPO();
-        McConvEvntPO mcConvEvntPO = new McConvEvntPO();
-
-        mcCeventPO.setCeventId(mainId);
-        mcCeventPO.setCeventTypGrpCde("CONVERSION_EVENT");
-        mcCeventPO.setCeventTypCde(caRSCDTO.getActionTypeList().contains("/RGHT/") ? "RIGHTS_SUBSCRIP" : "SPLIT_CONSOLID");
-        mcCeventPO.setEvntNam("Coupon Payment");
-        mcCeventPO.setCeventStatCde(PropertyConverUtils.divAnnStatusCovert(caRSCDTO.getStatus()));
-        mcCeventPO.setMrktId(findMarketId(PropertyConverUtils.marketCodeConver(caRSCDTO.getMarket())));
-        mcCeventPO.setInstrId(findInstrIdByCodeProcess(caRSCDTO.getInstrument()));
-        mcCeventPO.setCcassAnnouncementNum(caRSCDTO.getReferenceNo());
-        mcCeventPO.setSholdDate(caRSCDTO.getExDividendDate());
-        mcCeventPO.setCutoffDate(caRSCDTO.getPayableDate());
-        mcCeventPO.setAuthDate(caRSCDTO.getExDividendDate());
-        mcCeventPO.setNomineeLetrInd("N");
-        mcCeventPO.setIsAlertAftrActn("N");
-        mcCeventPO.setIsAlertAftrDeadline("N");
-        mcCeventPO.setRemrk(caRSCDTO.getAnnouncementSummary());
-        mcCeventPO.setIsSholdCaptured("N");
-        mcCeventPO.setIsNotfSent("N");
-        mcCeventPO.setIsPendActivate("N");
-        mcCeventPO.setCmpltDate(caRSCDTO.getPayableDate());
-        mcCeventPO.setActivationDate(caRSCDTO.getPayableDate());
-        mcCeventPO.setActCutoffDate(caRSCDTO.getPayableDate());
-        mcCeventPO.setCutoffRevCnt(0);
-        mcCeventPO.setAuthRevCnt(0);
-        mcCeventPO.setExchRateUpdCnt(0);
-        mcCeventPO.setCmpnyCde("TFS");
-        mcCeventPO.setExcessAlotCnt(0);
-        mcCeventPO.setRcalcChrgCnt(0);
-        mcCeventPO.setRecVerNum(0L);
-        mcCeventPO.setInitTime(LocalDateTime.now());
-        mcCeventPO.setLastUpdTime(LocalDateTime.now());
-        mcCeventPO.setLastUpdBy("MIG");
-        mcCeventPO.setTagSeq(0L);
-        mcCeventPO.setIsPrces("N");
-        mcCeventPO.setIsSholdAmended("N");
-        mcCeventPO.setIsEnotf("N");
-        mcCeventPO.setCeventCreatTypCde("MANUAL");
-        mcCeventPO.setDefTaxRate(BigDecimal.ONE);
-        mcCeventPO.setIsOtcrTxn("N");
-
-        mcConvEvntPO.setCeventId(mainId);
-        mcConvEvntPO.setNewInstrId(caRSCDTO.getActionTypeList().contains("RGHT") ? findInstrIdByCodeProcess(caRSCDTO.getRightsInstrument()) : caRSCDTO.getActionTypeList().contains("SPLT") ? findInstrIdByCodeProcess(caRSCDTO.getSplitInstrument()) : findInstrIdByCodeProcess(caRSCDTO.getCombineInstrument()));
-        mcConvEvntPO.setSharRatioInit(BigDecimal.valueOf(caRSCDTO.getActionTypeList().contains("RGHT") ? caRSCDTO.getRightsIssue() : caRSCDTO.getActionTypeList().contains("SPLT") ? caRSCDTO.getSplitFrom() : caRSCDTO.getCombineFrom()));
-        mcConvEvntPO.setSharRatioTo(BigDecimal.valueOf(caRSCDTO.getActionTypeList().contains("RGHT") ? caRSCDTO.getRightsFor() : caRSCDTO.getActionTypeList().contains("SPLT") ? caRSCDTO.getSplitTo() : caRSCDTO.getCombineTo()));
-        mcConvEvntPO.setIsCcassStk("N");
-
-        result.setMainRecord(mcConvEvntPO);
-        result.setDetailRecord(mcCeventPO);
-        result.setTableFlag(caRSCDTO.getActionTypeList().contains("RGHT") ? "rights" : caRSCDTO.getActionTypeList().contains("SPLT") ? "split" : "consolidation");
-        result.setCcy(caRSCDTO.getCcy());
-        result.setMarket(caRSCDTO.getMarket());
-        result.setAnnouncementNo(caRSCDTO.getAnnouncementNo());
-        result.setActionTypeList(caRSCDTO.getActionTypeList());
-        result.setInstrument(caRSCDTO.getInstrument());
-        result.setRightsIssue(caRSCDTO.getRightsIssue() == null ? null : BigDecimal.valueOf(caRSCDTO.getRightsIssue()));
-        result.setRightsFor(caRSCDTO.getRightsFor() == null ? null : BigDecimal.valueOf(caRSCDTO.getRightsFor()));
-        result.setRightsInstrument(caRSCDTO.getRightsInstrument() == null ? null : caRSCDTO.getRightsInstrument());
-        result.setSplitFrom(caRSCDTO.getSplitFrom() == null ? null : BigDecimal.valueOf(caRSCDTO.getSplitFrom()));
-        result.setSplitTo(caRSCDTO.getSplitTo() == null ? null : BigDecimal.valueOf(caRSCDTO.getSplitTo()));
-        result.setSplitInstrument(caRSCDTO.getSplitInstrument() == null ? null : caRSCDTO.getSplitInstrument());
-        result.setCombineFrom(caRSCDTO.getCombineFrom() == null ? null : BigDecimal.valueOf(caRSCDTO.getCombineFrom()));
-        result.setCombineTo(caRSCDTO.getCombineTo() == null ? null : BigDecimal.valueOf(caRSCDTO.getCombineTo()));
-        result.setCombineInstrument(caRSCDTO.getCombineInstrument() == null ? null : caRSCDTO.getCombineInstrument());
-
-        insertMasterData(caRSCDTO, mainId, mcCeventPO);
-
-        return result;
-    }
-
-    private void insertMasterData(CaRSCDTO caRSCDTO, Long mainId, McCeventPO mcCeventPO) {
-        if(caRSCDTO.getActionTypeList().contains("RGHT")){
-            masterDataService.insertRightsData(caRSCDTO, mainId, mcCeventPO);
-        }
-        if(caRSCDTO.getActionTypeList().contains("SPLT")){
-            masterDataService.insertSplitData(caRSCDTO, mainId, mcCeventPO);
-        }
-        if(caRSCDTO.getActionTypeList().contains("CONS")){
-            masterDataService.insertCombineData(caRSCDTO, mainId, mcCeventPO);
-        }
-    }
-
-    private Long findInstrIdByCodeProcess(String instrument){
-        List<McInstrPO> instrIdByCodeList = mcInstrMapper.findInstrIdByCodeList(instrument);
-        if(CollectionUtils.isEmpty(instrIdByCodeList)){
-            return null;
-        }
-        return instrIdByCodeList.get(0).getInstrId();
-    }
-
-    private Long findMarketId(String market) {
-        McMrktPO instrIdByCode = mcMrktMapper.findInstrIdByCode(market);
-        return instrIdByCode.getMrktId();
-    }
-}
-
-
-
-
-package org.example.service;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import lombok.RequiredArgsConstructor;
-import org.example.mapper.*;
-import org.example.pojo.*;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.math.BigDecimal;
-
-@Service
-@RequiredArgsConstructor
-public class MasterDataService {
-
+    private final McCeventMapper mcCeventMapper;
+    private final McConvEvntMapper mcConvEvntMapper;
     private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
     private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
     private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
-    private final McInstrMapper mcInstrMapper;
 
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertRightsData(CaRSCDTO caRSCDTO, Long mainId, McCeventPO mcCeventPO) {
-        DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-        divAnnRightsMapMSSEPO.setMarket(caRSCDTO.getMarket());
-        divAnnRightsMapMSSEPO.setCcy(caRSCDTO.getCcy());
-        divAnnRightsMapMSSEPO.setAnnouncementNo(caRSCDTO.getAnnouncementNo());
-        divAnnRightsMapMSSEPO.setInstrument(caRSCDTO.getInstrument());
-        divAnnRightsMapMSSEPO.setActionTypeList(caRSCDTO.getActionTypeList());
-        divAnnRightsMapMSSEPO.setReferenceNo(caRSCDTO.getReferenceNo());
-        divAnnRightsMapMSSEPO.setRightsFor(BigDecimal.valueOf(caRSCDTO.getRightsFor()));
-        divAnnRightsMapMSSEPO.setRightsIssue(BigDecimal.valueOf(caRSCDTO.getRightsIssue()));
-        divAnnRightsMapMSSEPO.setRightsInstrument(caRSCDTO.getRightsInstrument());
-        divAnnRightsMapMSSEPO.setCeventId(mainId);
-        divAnnRightsMapMSSEPO.setMrktId(mcCeventPO.getMrktId());
-        divAnnRightsMapMSSEPO.setInstrId(mcCeventPO.getInstrId());
-        divAnnRightsMapMSSEPO.setCcassAnnouncementNum(mcCeventPO.getCcassAnnouncementNum());
-        divAnnRightsMapMSSEPO.setCeventTypGrpCde(mcCeventPO.getCeventTypGrpCde());
-        divAnnRightsMapMSSEPO.setSharRatioInit(BigDecimal.valueOf(caRSCDTO.getRightsIssue()));
-        divAnnRightsMapMSSEPO.setSharRatioTo(BigDecimal.valueOf(caRSCDTO.getRightsFor()));
-        divAnnRightsMapMSSEPO.setNewInstrId(findInstrIdByCodeProcess(caRSCDTO.getRightsInstrument()));
-        divAnnRightsMapMSSEMapper.insert(divAnnRightsMapMSSEPO);
-    }
-
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertSplitData(CaRSCDTO caRSCDTO, Long mainId, McCeventPO mcCeventPO) {
-        DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-        divAnnSplitMapMSSEPO.setMarket(caRSCDTO.getMarket());
-        divAnnSplitMapMSSEPO.setCcy(caRSCDTO.getCcy());
-        divAnnSplitMapMSSEPO.setAnnouncementNo(caRSCDTO.getAnnouncementNo());
-        divAnnSplitMapMSSEPO.setInstrument(caRSCDTO.getInstrument());
-        divAnnSplitMapMSSEPO.setActionTypeList(caRSCDTO.getActionTypeList());
-        divAnnSplitMapMSSEPO.setReferenceNo(caRSCDTO.getReferenceNo());
-        divAnnSplitMapMSSEPO.setSplitFrom(BigDecimal.valueOf(caRSCDTO.getSplitFrom()));
-        divAnnSplitMapMSSEPO.setSplitTo(BigDecimal.valueOf(caRSCDTO.getSplitTo()));
-        divAnnSplitMapMSSEPO.setSplitInstrument(caRSCDTO.getSplitInstrument());
-        divAnnSplitMapMSSEPO.setCeventId(mainId);
-        divAnnSplitMapMSSEPO.setMrktId(mcCeventPO.getMrktId());
-        divAnnSplitMapMSSEPO.setInstrId(mcCeventPO.getInstrId());
-        divAnnSplitMapMSSEPO.setCcassAnnouncementNum(mcCeventPO.getCcassAnnouncementNum());
-        divAnnSplitMapMSSEPO.setCeventTypGrpCde(mcCeventPO.getCeventTypGrpCde());
-        divAnnSplitMapMSSEPO.setSharRatioInit(BigDecimal.valueOf(caRSCDTO.getSplitFrom()));
-        divAnnSplitMapMSSEPO.setSharRatioTo(BigDecimal.valueOf(caRSCDTO.getSplitTo()));
-        divAnnSplitMapMSSEPO.setNewInstrId(findInstrIdByCodeProcess(caRSCDTO.getSplitInstrument()));
-        divAnnSplitMapMSSEMapper.insert(divAnnSplitMapMSSEPO);
-    }
-
-    @DS("master")
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
-    public void insertCombineData(CaRSCDTO caRSCDTO, Long mainId, McCeventPO mcCeventPO) {
-        DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-        divAnnCombineMapMSSEPO.setMarket(caRSCDTO.getMarket());
-        divAnnCombineMapMSSEPO.setCcy(caRSCDTO.getCcy());
-        divAnnCombineMapMSSEPO.setAnnouncementNo(caRSCDTO.getAnnouncementNo());
-        divAnnCombineMapMSSEPO.setInstrument(caRSCDTO.getInstrument());
-        divAnnCombineMapMSSEPO.setActionTypeList(caRSCDTO.getActionTypeList());
-        divAnnCombineMapMSSEPO.setReferenceNo(caRSCDTO.getReferenceNo());
-        divAnnCombineMapMSSEPO.setCombineFrom(BigDecimal.valueOf(caRSCDTO.getCombineFrom()));
-        divAnnCombineMapMSSEPO.setCombineTo(BigDecimal.valueOf(caRSCDTO.getCombineTo()));
-        divAnnCombineMapMSSEPO.setCombineInstrument(caRSCDTO.getCombineInstrument());
-        divAnnCombineMapMSSEPO.setCeventId(mainId);
-        divAnnCombineMapMSSEPO.setMrktId(mcCeventPO.getMrktId());
-        divAnnCombineMapMSSEPO.setInstrId(mcCeventPO.getInstrId());
-        divAnnCombineMapMSSEPO.setCcassAnnouncementNum(mcCeventPO.getCcassAnnouncementNum());
-        divAnnCombineMapMSSEPO.setCeventTypGrpCde(mcCeventPO.getCeventTypGrpCde());
-        divAnnCombineMapMSSEPO.setSharRatioInit(BigDecimal.valueOf(caRSCDTO.getCombineFrom()));
-        divAnnCombineMapMSSEPO.setSharRatioTo(BigDecimal.valueOf(caRSCDTO.getCombineTo()));
-        divAnnCombineMapMSSEPO.setNewInstrId(findInstrIdByCodeProcess(caRSCDTO.getCombineInstrument()));
-        divAnnCombineMapMSSEMapper.insert(divAnnCombineMapMSSEPO);
-    }
-
-    private Long findInstrIdByCodeProcess(String instrument){
-        java.util.List<McInstrPO> instrIdByCodeList = mcInstrMapper.findInstrIdByCodeList(instrument);
-        if(org.springframework.util.CollectionUtils.isEmpty(instrIdByCodeList)){
-            return null;
+    @Override
+    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
+        if(items.isEmpty()){
+            return;
         }
-        return instrIdByCodeList.get(0).getInstrId();
+
+        List<McConvEvntPO> rightsRecord = new ArrayList<>();
+        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();
+        List<McConvEvntPO> splitRecord = new ArrayList<>();
+        List<McCeventPO> splitDetailsRecord = new ArrayList<>();
+        List<McConvEvntPO> consolidRecord = new ArrayList<>();
+        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();
+
+        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
+        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
+        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
+
+        for (CaRSCResultDTO dto : items){
+            if(Objects.equals(dto.getTableFlag(), "rights")){
+                rightsRecord.add(dto.getMainRecord());
+                rightsDetailsRecord.add(dto.getDetailRecord());
+                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
+                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
+                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
+                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
+                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
+                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
+                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
+            }
+            if(Objects.equals(dto.getTableFlag(), "split")){
+                splitRecord.add(dto.getMainRecord());
+                splitDetailsRecord.add(dto.getDetailRecord());
+                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
+                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
+                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
+                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
+                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
+                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
+                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
+            }
+            if(Objects.equals(dto.getTableFlag(), "consolidation")){
+                consolidRecord.add(dto.getMainRecord());
+                consolidDetailsRecord.add(dto.getDetailRecord());
+                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
+                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
+                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
+                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
+                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
+                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
+                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
+                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
+                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
+                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
+                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
+                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
+                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
+                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
+                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
+                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
+                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
+            }
+        }
+        
+        for (int i = 0; i < divAnnRightsMapMSSEPOList.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, divAnnRightsMapMSSEPOList.size());
+            List<DivAnnRightsMapMSSEPO> subList = divAnnRightsMapMSSEPOList.subList(i, end);
+            for (DivAnnRightsMapMSSEPO po : subList) {
+                divAnnRightsMapMSSEMapper.insert(po);
+            }
+        }
+        
+        for (int i = 0; i < divAnnSplitMapMSSEPOList.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, divAnnSplitMapMSSEPOList.size());
+            List<DivAnnSplitMapMSSEPO> subList = divAnnSplitMapMSSEPOList.subList(i, end);
+            for (DivAnnSplitMapMSSEPO po : subList) {
+                divAnnSplitMapMSSEMapper.insert(po);
+            }
+        }
+        
+        for (int i = 0; i < divAnnCombineMapMSSEPOList.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, divAnnCombineMapMSSEPOList.size());
+            List<DivAnnCombineMapMSSEPO> subList = divAnnCombineMapMSSEPOList.subList(i, end);
+            for (DivAnnCombineMapMSSEPO po : subList) {
+                divAnnCombineMapMSSEMapper.insert(po);
+            }
+        }
+        
+        DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
+        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
+//        batchInsertDetailRecords(detailsRecord);
+//        batchInsertMainRecords(mainRecord);
+
+        rightsRecord.clear();
+        rightsDetailsRecord.clear();
+        splitRecord.clear();
+        splitDetailsRecord.clear();
+        consolidRecord.clear();
+        consolidDetailsRecord.clear();
+        divAnnRightsMapMSSEPOList.clear();
+        divAnnSplitMapMSSEPOList.clear();
+        divAnnCombineMapMSSEPOList.clear();// 内存回收
     }
+
+//    private void batchInsertDetailRecords(List<McCeventPO> detailsRecord) {
+//        if(detailsRecord.isEmpty()){
+//            return;
+//        }
+//
+//        for (int i = 0; i < detailsRecord.size(); i+=BATCH_SIZE) {
+//            int end = Math.min(i+BATCH_SIZE,detailsRecord.size());
+//            List<McCeventPO> mcCeventPOList = detailsRecord.subList(i, end);
+//            mcCeventMapper.batchInsert(mcCeventPOList);
+//        }
+//    }
+//
+//    private void batchInsertMainRecords(List<McConvEvntPO> mainRecord) {
+//
+//        if(mainRecord.isEmpty()){
+//            return;
+//        }
+//
+//        for (int i = 0; i < mainRecord.size(); i+=BATCH_SIZE) {
+//            int end = Math.min(i+BATCH_SIZE,mainRecord.size());
+//            List<McConvEvntPO> mcConvEvntPOList = mainRecord.subList(i, end);
+//            mcConvEvntMapper.batchInsert(mcConvEvntPOList);
+//        }
+//
+//    }
 }
