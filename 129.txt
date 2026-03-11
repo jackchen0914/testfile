@@ -1,185 +1,570 @@
-package org.example.batch.writer;
+    <select id="selectCashVoucherWithRequestByCursor" resultMap="CashVoucherWithRequestMap">
+        select
+        t1.InputDate,
+        t1.Clnt,
+        t1.CCY,
+        t1.TxnType,
+        t1.VoucherNo,
+        t1.Amount,
+        t1.ValueDate,
+        t1.StatusFlag,
+        t1.ManualInput,
+        t1.VoucherDate,
+        t1.Userid,
+        t1.Remark,
+        t1.[Source],
+        t1.AccountName,
+        t1.AccountNumber,
+        t1.Status,
+        t1.Charge,
+        t1.CancelDate,
+        t1.ConfirmationDate,
+        t1.ApprovalTime,
+        t1.Market,
+        t2.Relationship,
+        t2.Mode,
+        t2.WithdrawMode,
+        t2.BenfName
+        from
+        CashVoucher t1
+        left join CashVoucherRequest t2 on
+        t1.VoucherNo = t2.VoucherNo
+        and t1.Market = t2.Market
+        where
+        SUBSTRING(t1.StatusFlag ,8,1) != 'Y'
+        <if test="lastVoucherNo != null and lastMarket != null">
+            and (t1.VoucherNo &gt; #{lastVoucherNo} 
+                 or (t1.VoucherNo = #{lastVoucherNo} and t1.Market &gt; #{lastMarket}))
+        </if>
+        order by
+        t1.VoucherNo, t1.Market
+        FETCH NEXT #{limit} ROWS ONLY;
+    </select>
 
+    <select id="selectCashVoucherWithRequestStream" resultMap="CashVoucherWithRequestMap" fetchSize="1000">
+        select
+        t1.InputDate,
+        t1.Clnt,
+        t1.CCY,
+        t1.TxnType,
+        t1.VoucherNo,
+        t1.Amount,
+        t1.ValueDate,
+        t1.StatusFlag,
+        t1.ManualInput,
+        t1.VoucherDate,
+        t1.Userid,
+        t1.Remark,
+        t1.[Source],
+        t1.AccountName,
+        t1.AccountNumber,
+        t1.Status,
+        t1.Charge,
+        t1.CancelDate,
+        t1.ConfirmationDate,
+        t1.ApprovalTime,
+        t1.Market,
+        t2.Relationship,
+        t2.Mode,
+        t2.WithdrawMode,
+        t2.BenfName
+        from
+        CashVoucher t1
+        left join CashVoucherRequest t2 on
+        t1.VoucherNo = t2.VoucherNo
+        and t1.Market = t2.Market
+        where
+        SUBSTRING(t1.StatusFlag ,8,1) != 'Y'
+        order by
+        t1.VoucherNo, t1.Market
+    </select>
+
+    <select id="countCashVoucherWithRequest" resultType="long">
+        select count(*)
+        from CashVoucher t1
+        where SUBSTRING(t1.StatusFlag, 8, 1) != 'Y'
+    </select>
+
+
+   List<CashVoucherWithRequestDTO> selectCashVoucherWithRequestByCursor(
+           @Param("lastVoucherNo") Integer lastVoucherNo,
+           @Param("lastMarket") String lastMarket,
+           @Param("limit") int limit);
+
+   void selectCashVoucherWithRequestStream(ResultHandler<CashVoucherWithRequestDTO> handler);
+
+   long countCashVoucherWithRequest();
+
+
+
+
+    @Select("select TransactionTypes, SignIndicator, StkMoney from dbo.TransactionTypes")
+    List<TransactionTypesPO> selectAllTransactionTypes();
+
+    @Select("select ccy, date, xrate from dbo.ForexRate")
+    List<ForexRatePO> selectAllForexRates();
+
+    @Select("select ccy, date, xrate from dbo.ForexRate where ccy = #{currency}")
+    List<ForexRatePO> selectRatesByCurrency(@Param("currency") String currency);
+
+
+
+
+
+package org.example.service.impl;
+
+import com.baomidou.dynamic.datasource.annotation.DS;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.ibatis.session.ResultHandler;
 import org.example.mapper.*;
 import org.example.pojo.*;
-import org.example.pojo.dtos.CaRSCResultDTO;
-import org.example.utils.DataBaseOperationUtils;
-import org.springframework.batch.item.ItemWriter;
-import org.springframework.stereotype.Component;
+import org.example.pojo.dtos.CashVoucherWithRequestDTO;
+import org.example.service.CashVoucherToMsseService;
+import org.example.service.IdGeneratorService;
+import org.example.utils.PropertyConverUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-@Component
+@Service
+@Slf4j
 @RequiredArgsConstructor
-public class CaRSCWriter implements ItemWriter<CaRSCResultDTO> {
+public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
 
-    private static final int BATCH_SIZE = 1000;
+    private final McAcFundRecMapper mcAcFundRecMapper;
+    private final McAcFundTxnRecMapper mcAcFundTxnRecMapper;
+    private final McFundTpReltnMapper mcFundTpReltnMapper;
+    private final CashVoucherMapper cashVoucherMapper;
+    private final ForexRateMapper forexRateMapper;
+    private final TransactionTypesMapper transactionTypesMapper;
+    private final CashVoucherMapMSSEMapper cashVoucherMapMSSEMapper;
+    private final IdGeneratorService idGeneratorService;
 
-    private final McCeventMapper mcCeventMapper;
-    private final McConvEvntMapper mcConvEvntMapper;
-    private final DivAnnRightsMapMSSEMapper divAnnRightsMapMSSEMapper;
-    private final DivAnnSplitMapMSSEMapper divAnnSplitMapMSSEMapper;
-    private final DivAnnCombineMapMSSEMapper divAnnCombineMapMSSEMapper;
+    private static final int BATCH_SIZE = 5000;
+    private static final int THREAD_POOL_SIZE = 4;
+    private static final int CURSOR_PAGE_SIZE = 10000;
+
+    private volatile Map<String, TransactionTypesPO> transactionTypesCache;
+    private volatile Map<String, ForexRatePO> forexRateCache;
+    private final Object cacheLock = new Object();
 
     @Override
-    public void write(List<? extends CaRSCResultDTO> items) throws Exception {
-        if(items.isEmpty()){
+    public String writeProcessedData() {
+        return writeProcessedDataByCursorPaging();
+    }
+
+    public String writeProcessedDataByCursorPaging() {
+        long startTime = System.currentTimeMillis();
+        initCaches();
+
+        long totalCount = cashVoucherMapper.countCashVoucherWithRequest();
+        log.info("开始迁移，总数据量: {}", totalCount);
+
+        AtomicInteger processedCount = new AtomicInteger(0);
+        AtomicLong lastVoucherNo = new AtomicLong(-1);
+        AtomicInteger lastMarketIndex = new AtomicInteger(-1);
+        String[] markets = {"HK", "SH", "SZ", "BJ"};
+
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        List<Future<?>> futures = new ArrayList<>();
+
+        while (true) {
+            Integer currentLastVoucherNo = lastVoucherNo.get() == -1 ? null : (int) lastVoucherNo.get();
+            String currentLastMarket = lastMarketIndex.get() == -1 ? null : markets[lastMarketIndex.get()];
+
+            List<CashVoucherWithRequestDTO> batch = cashVoucherMapper.selectCashVoucherWithRequestByCursor(
+                    currentLastVoucherNo, currentLastMarket, CURSOR_PAGE_SIZE);
+
+            if (batch == null || batch.isEmpty()) {
+                break;
+            }
+
+            CashVoucherWithRequestDTO lastItem = batch.get(batch.size() - 1);
+            lastVoucherNo.set(lastItem.getVoucherNo());
+            lastMarketIndex.set(Arrays.asList(markets).indexOf(lastItem.getMarket()));
+
+            final List<CashVoucherWithRequestDTO> batchToProcess = batch;
+            Future<?> future = executor.submit(() -> {
+                processBatch(batchToProcess);
+                int processed = processedCount.addAndGet(batchToProcess.size());
+                if (processed % 50000 == 0) {
+                    log.info("已处理: {}/{} ({}%)", processed, totalCount,
+                            String.format("%.2f", processed * 100.0 / totalCount));
+                }
+            });
+            futures.add(future);
+
+            if (futures.size() >= THREAD_POOL_SIZE * 2) {
+                waitForSomeFutures(futures);
+            }
+        }
+
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (Exception e) {
+                log.error("任务执行异常", e);
+            }
+        }
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(1, TimeUnit.HOURS);
+        } catch (InterruptedException e) {
+            log.error("线程池关闭被中断", e);
+        }
+
+        long endTime = System.currentTimeMillis();
+        log.info("迁移完成，总耗时: {}秒，处理数据: {}", (endTime - startTime) / 1000, processedCount.get());
+        return "ok";
+    }
+
+    public String writeProcessedDataByStream() {
+        long startTime = System.currentTimeMillis();
+        initCaches();
+
+        long totalCount = cashVoucherMapper.countCashVoucherWithRequest();
+        log.info("开始流式迁移，总数据量: {}", totalCount);
+
+        AtomicInteger processedCount = new AtomicInteger(0);
+        List<McAcFundRecPO> mcAcFundRecPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
+        List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
+        List<McFundTpReltnPO> mcFundTpReltnPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
+        List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
+
+        cashVoucherMapper.selectCashVoucherWithRequestStream(context -> {
+            CashVoucherWithRequestDTO item = context.getResultObject();
+            processSingleItem(item, mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+
+            int processed = processedCount.incrementAndGet();
+            if (processed % BATCH_SIZE == 0) {
+                flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                        mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+                log.info("已处理: {}/{} ({}%)", processed, totalCount,
+                        String.format("%.2f", processed * 100.0 / totalCount));
+            }
+        });
+
+        if (!mcAcFundRecPOList.isEmpty()) {
+            flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+        }
+
+        long endTime = System.currentTimeMillis();
+        log.info("流式迁移完成，总耗时: {}秒，处理数据: {}", (endTime - startTime) / 1000, processedCount.get());
+        return "ok";
+    }
+
+    private void initCaches() {
+        if (transactionTypesCache == null || forexRateCache == null) {
+            synchronized (cacheLock) {
+                if (transactionTypesCache == null) {
+                    List<TransactionTypesPO> txnTypes = transactionTypesMapper.selectAllTransactionTypes();
+                    transactionTypesCache = new ConcurrentHashMap<>();
+                    for (TransactionTypesPO po : txnTypes) {
+                        String key = po.getStkMoney() + "_" + po.getTransactionTypes();
+                        transactionTypesCache.put(key, po);
+                    }
+                    log.info("TransactionTypes缓存加载完成，共{}条", transactionTypesCache.size());
+                }
+                if (forexRateCache == null) {
+                    List<ForexRatePO> rates = forexRateMapper.selectAllForexRates();
+                    forexRateCache = new ConcurrentHashMap<>();
+                    for (ForexRatePO po : rates) {
+                        if (po.getDate() != null) {
+                            String key = po.getCcy() + "_" + po.getDate().toLocalDate().toString();
+                            forexRateCache.put(key, po);
+                        }
+                    }
+                    log.info("ForexRate缓存加载完成，共{}条", forexRateCache.size());
+                }
+            }
+        }
+    }
+
+    private void waitForSomeFutures(List<Future<?>> futures) {
+        Iterator<Future<?>> iterator = futures.iterator();
+        while (iterator.hasNext()) {
+            Future<?> future = iterator.next();
+            if (future.isDone()) {
+                try {
+                    future.get();
+                } catch (Exception e) {
+                    log.error("任务执行异常", e);
+                }
+                iterator.remove();
+            }
+        }
+    }
+
+    private void processBatch(List<CashVoucherWithRequestDTO> batch) {
+        List<McAcFundRecPO> mcAcFundRecPOList = new ArrayList<>(batch.size());
+        List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = new ArrayList<>(batch.size());
+        List<McFundTpReltnPO> mcFundTpReltnPOList = new ArrayList<>(batch.size());
+        List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = new ArrayList<>(batch.size());
+
+        for (int i = 0; i < batch.size(); i++) {
+            CashVoucherWithRequestDTO items = batch.get(i);
+            processSingleItemWithIndex(items, i, mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+        }
+
+        flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+    }
+
+    private void processSingleItem(CashVoucherWithRequestDTO items,
+                                   List<McAcFundRecPO> mcAcFundRecPOList,
+                                   List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
+                                   List<McFundTpReltnPO> mcFundTpReltnPOList,
+                                   List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
+        processSingleItemWithIndex(items, 0, mcAcFundRecPOList, mcAcFundTxnRecPOList,
+                mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+    }
+
+    private void processSingleItemWithIndex(CashVoucherWithRequestDTO items, int index,
+                                            List<McAcFundRecPO> mcAcFundRecPOList,
+                                            List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
+                                            List<McFundTpReltnPO> mcFundTpReltnPOList,
+                                            List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
+        Long mainId = idGeneratorService.generateMainId();
+        Long acFundRid = idGeneratorService.generateDetailId();
+
+        McAcFundRecPO mcAcFundRecPO = new McAcFundRecPO();
+        McAcFundTxnRecPO mcAcFundTxnRecPO = new McAcFundTxnRecPO();
+        McFundTpReltnPO mcFundTpReltnPO = new McFundTpReltnPO();
+        CashVoucherMapMSSEPO cashVoucherMapMSSEPO = new CashVoucherMapMSSEPO();
+
+        mcAcFundTxnRecPO.setAcFundTxnRid(mainId);
+        mcAcFundTxnRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
+        mcAcFundTxnRecPO.setIsRev("N");
+        mcAcFundTxnRecPO.setRevAcFundTxnRid(null);
+        mcAcFundTxnRecPO.setRecVerNum(0L);
+        mcAcFundTxnRecPO.setInitTime(LocalDateTime.now());
+        mcAcFundTxnRecPO.setLastUpdTime(LocalDateTime.now());
+        mcAcFundTxnRecPO.setLastUpdBy("MIG");
+        mcAcFundTxnRecPO.setTagSeq(0L);
+
+        mcAcFundRecPO.setAcFundRid(acFundRid);
+        mcAcFundRecPO.setCmpnyIbusdate(items.getVoucherDate());
+        mcAcFundRecPO.setCmpnyBusdate(items.getVoucherDate());
+        mcAcFundRecPO.setAcId("02-0000389-30");
+        mcAcFundRecPO.setCcyCde(PropertyConverUtils.standardizeCurrencyCode(items.getCcy()));
+        mcAcFundRecPO.setSegrFundId(1L);
+        mcAcFundRecPO.setCmpnyCde("TFS");
+        mcAcFundRecPO.setTxnTypId(txnTypIdValueConvertFromCache(items.getTxnType()));
+        mcAcFundRecPO.setValDate(items.getValueDate());
+        mcAcFundRecPO.setAmt(items.getAmount().abs());
+        mcAcFundRecPO.setIsNonAcHldr("N");
+        mcAcFundRecPO.setRemrk(items.getRemark());
+        mcAcFundRecPO.setBankCde(items.getSource());
+        mcAcFundRecPO.setPayeNam(items.getAccountName());
+        mcAcFundRecPO.setOthAcPayeNam(items.getBenfName());
+        mcAcFundRecPO.setClntBankCde(items.getSource());
+        mcAcFundRecPO.setClntBankAcNum(items.getAccountNumber());
+        mcAcFundRecPO.setIsPrtRcpt("N");
+        mcAcFundRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
+        mcAcFundRecPO.setFundChnlCde(Objects.equals(items.getManualInput(), "Yes") ? "MANUALINP" : "SYSTEM");
+        mcAcFundRecPO.setTxnTypActnCde(txnTypActnCdeValueCovertFromCache(items.getTxnType()));
+        mcAcFundRecPO.setIsMemo("N");
+        mcAcFundRecPO.setIsChq(isChqAndIsTrnfrTrans(items, "chq"));
+        mcAcFundRecPO.setIsChrg(items.getCharge() != null && items.getCharge().contains("YES") ? "Y" : "N");
+        mcAcFundRecPO.setIsTrnfr(isChqAndIsTrnfrTrans(items, "trnfr"));
+        mcAcFundRecPO.setIsRev(isRevTrans(items));
+        mcAcFundRecPO.setIsDhon("N");
+        mcAcFundRecPO.setIsRtun("N");
+        mcAcFundRecPO.setIsUnderRevrse("N");
+        mcAcFundRecPO.setIsUnderDhon("N");
+        mcAcFundRecPO.setIsUnderRtun("N");
+        mcAcFundRecPO.setIsTodayRev(isTodayRevTrans(items));
+        mcAcFundRecPO.setIsTrigCreat("N");
+        mcAcFundRecPO.setPrimyRemrkFrStmt(items.getRemark());
+        mcAcFundRecPO.setBaseCcyEquAmt(baseCcyEquAmtValueProcessFromCache(items));
+        mcAcFundRecPO.setIsAutoAprv("N");
+        mcAcFundRecPO.setIsIgnrDatSync("N");
+        mcAcFundRecPO.setRvisUnit("0031");
+        mcAcFundRecPO.setRvisBy("MIG");
+        mcAcFundRecPO.setLastRvisTime(LocalDateTime.now());
+        mcAcFundRecPO.setChkBy("MIG");
+        mcAcFundRecPO.setAprvRejCmpnyIbusdate(items.getApprovalTime());
+        mcAcFundRecPO.setAprvRejCmpnyBusdate(items.getApprovalTime());
+        mcAcFundRecPO.setAprvRejTime(items.getApprovalTime());
+        mcAcFundRecPO.setIsElectronic("N");
+        mcAcFundRecPO.setIsWork("N");
+        mcAcFundRecPO.setAcFundTxnRid(mainId);
+        mcAcFundRecPO.setIsOperateInFund("N");
+        mcAcFundRecPO.setIsInstrRelt("N");
+        mcAcFundRecPO.setIsPost("N");
+        mcAcFundRecPO.setRecVerNum(0L);
+        mcAcFundRecPO.setInitTime(LocalDateTime.now());
+        mcAcFundRecPO.setLastUpdTime(LocalDateTime.now());
+        mcAcFundRecPO.setLastUpdBy("MIG");
+        mcAcFundRecPO.setTagSeq(0L);
+        mcAcFundRecPO.setExtrnlRefNum(items.getMarket() + items.getVoucherNo());
+        mcAcFundRecPO.setExtrnlSysCde("OctOBack");
+        mcAcFundRecPO.setInitUser("MIG");
+        mcAcFundRecPO.setInitUserUnit("0031");
+        mcAcFundRecPO.setIsReact("N");
+        mcAcFundRecPO.setIsUnderReact("N");
+        mcAcFundRecPO.setIsNonRegBankAc("N");
+        mcAcFundRecPO.setFundTpReltnCde(items.getRelationship());
+
+        mcFundTpReltnPO.setFundTpReltnCde(StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + index) : items.getRelationship());
+        mcFundTpReltnPO.setFundTpReltnDscr(StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + index) : items.getRelationship());
+        mcFundTpReltnPO.setFundTpReltnPri((long) (18 + index));
+        mcFundTpReltnPO.setIsInact("N");
+        mcFundTpReltnPO.setRecVerNum(0L);
+        mcFundTpReltnPO.setInitTime(LocalDateTime.now());
+        mcFundTpReltnPO.setLastUpdTime(LocalDateTime.now());
+        mcFundTpReltnPO.setLastUpdBy("MIG");
+        mcFundTpReltnPO.setTagSeq(0L);
+
+        cashVoucherMapMSSEPO.setVoucherNo(items.getVoucherNo());
+        cashVoucherMapMSSEPO.setMarket(items.getMarket());
+        cashVoucherMapMSSEPO.setAcFundRid(acFundRid);
+
+        cashVoucherMapMSSEPOList.add(cashVoucherMapMSSEPO);
+        mcAcFundRecPOList.add(mcAcFundRecPO);
+        mcAcFundTxnRecPOList.add(mcAcFundTxnRecPO);
+        mcFundTpReltnPOList.add(mcFundTpReltnPO);
+    }
+
+    private void flushToOracle(List<McAcFundRecPO> mcAcFundRecPOList,
+                               List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
+                               List<McFundTpReltnPO> mcFundTpReltnPOList,
+                               List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
+        if (mcAcFundRecPOList.isEmpty()) {
             return;
         }
 
-        List<McConvEvntPO> rightsRecord = new ArrayList<>();
-        List<McCeventPO> rightsDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> splitRecord = new ArrayList<>();
-        List<McCeventPO> splitDetailsRecord = new ArrayList<>();
-        List<McConvEvntPO> consolidRecord = new ArrayList<>();
-        List<McCeventPO> consolidDetailsRecord = new ArrayList<>();
+        List<McAcFundRecPO> recList = new ArrayList<>(mcAcFundRecPOList);
+        List<McAcFundTxnRecPO> txnList = new ArrayList<>(mcAcFundTxnRecPOList);
+        List<McFundTpReltnPO> reltnList = new ArrayList<>(mcFundTpReltnPOList);
+        List<CashVoucherMapMSSEPO> mapList = new ArrayList<>(cashVoucherMapMSSEPOList);
 
-        List<DivAnnRightsMapMSSEPO> divAnnRightsMapMSSEPOList = new ArrayList<>();
-        List<DivAnnSplitMapMSSEPO> divAnnSplitMapMSSEPOList = new ArrayList<>();
-        List<DivAnnCombineMapMSSEPO> divAnnCombineMapMSSEPOList = new ArrayList<>();
+        mcAcFundRecPOList.clear();
+        mcAcFundTxnRecPOList.clear();
+        mcFundTpReltnPOList.clear();
+        cashVoucherMapMSSEPOList.clear();
 
-        for (CaRSCResultDTO dto : items){
-            if(Objects.equals(dto.getTableFlag(), "rights")){
-                rightsRecord.add(dto.getMainRecord());
-                rightsDetailsRecord.add(dto.getDetailRecord());
-                DivAnnRightsMapMSSEPO divAnnRightsMapMSSEPO = new DivAnnRightsMapMSSEPO();
-                divAnnRightsMapMSSEPO.setMarket(dto.getMarket());
-                divAnnRightsMapMSSEPO.setCcy(dto.getCcy());
-                divAnnRightsMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnRightsMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnRightsMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnRightsMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setRightsFor(dto.getRightsFor());
-                divAnnRightsMapMSSEPO.setRightsIssue(dto.getRightsIssue());
-                divAnnRightsMapMSSEPO.setRightsInstrument(dto.getRightsInstrument());
-                divAnnRightsMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnRightsMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnRightsMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnRightsMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnRightsMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnRightsMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnRightsMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnRightsMapMSSEPOList.add(divAnnRightsMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "split")){
-                splitRecord.add(dto.getMainRecord());
-                splitDetailsRecord.add(dto.getDetailRecord());
-                DivAnnSplitMapMSSEPO divAnnSplitMapMSSEPO = new DivAnnSplitMapMSSEPO();
-                divAnnSplitMapMSSEPO.setMarket(dto.getMarket());
-                divAnnSplitMapMSSEPO.setCcy(dto.getCcy());
-                divAnnSplitMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnSplitMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnSplitMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnSplitMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setSplitFrom(dto.getSplitFrom());
-                divAnnSplitMapMSSEPO.setSplitTo(dto.getSplitTo());
-                divAnnSplitMapMSSEPO.setSplitInstrument(dto.getSplitInstrument());
-                divAnnSplitMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnSplitMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnSplitMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnSplitMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnSplitMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnSplitMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnSplitMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnSplitMapMSSEPOList.add(divAnnSplitMapMSSEPO);
-            }
-            if(Objects.equals(dto.getTableFlag(), "consolidation")){
-                consolidRecord.add(dto.getMainRecord());
-                consolidDetailsRecord.add(dto.getDetailRecord());
-                DivAnnCombineMapMSSEPO divAnnCombineMapMSSEPO = new DivAnnCombineMapMSSEPO();
-                divAnnCombineMapMSSEPO.setMarket(dto.getMarket());
-                divAnnCombineMapMSSEPO.setCcy(dto.getCcy());
-                divAnnCombineMapMSSEPO.setAnnouncementNo(dto.getAnnouncementNo());
-                divAnnCombineMapMSSEPO.setInstrument(dto.getInstrument());
-                divAnnCombineMapMSSEPO.setActionTypeList(dto.getActionTypeList());
-                divAnnCombineMapMSSEPO.setReferenceNo(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCombineFrom(dto.getCombineFrom());
-                divAnnCombineMapMSSEPO.setCombineTo(dto.getCombineTo());
-                divAnnCombineMapMSSEPO.setCombineInstrument(dto.getCombineInstrument());
-                divAnnCombineMapMSSEPO.setCeventId(dto.getDetailRecord().getCeventId());
-                divAnnCombineMapMSSEPO.setMrktId(dto.getDetailRecord().getMrktId());
-                divAnnCombineMapMSSEPO.setInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPO.setCcassAnnouncementNum(dto.getDetailRecord().getCcassAnnouncementNum());
-                divAnnCombineMapMSSEPO.setCeventTypGrpCde(dto.getDetailRecord().getCeventTypGrpCde());
-                divAnnCombineMapMSSEPO.setSharRatioInit(dto.getMainRecord().getSharRatioInit());
-                divAnnCombineMapMSSEPO.setSharRatioTo(dto.getMainRecord().getSharRatioTo());
-                divAnnCombineMapMSSEPO.setNewInstrId(dto.getDetailRecord().getInstrId());
-                divAnnCombineMapMSSEPOList.add(divAnnCombineMapMSSEPO);
-            }
-        }
-        
-        for (int i = 0; i < divAnnRightsMapMSSEPOList.size(); i += BATCH_SIZE) {
-            int end = Math.min(i + BATCH_SIZE, divAnnRightsMapMSSEPOList.size());
-            List<DivAnnRightsMapMSSEPO> subList = divAnnRightsMapMSSEPOList.subList(i, end);
-            for (DivAnnRightsMapMSSEPO po : subList) {
-                divAnnRightsMapMSSEMapper.insert(po);
-            }
-        }
-        
-        for (int i = 0; i < divAnnSplitMapMSSEPOList.size(); i += BATCH_SIZE) {
-            int end = Math.min(i + BATCH_SIZE, divAnnSplitMapMSSEPOList.size());
-            List<DivAnnSplitMapMSSEPO> subList = divAnnSplitMapMSSEPOList.subList(i, end);
-            for (DivAnnSplitMapMSSEPO po : subList) {
-                divAnnSplitMapMSSEMapper.insert(po);
-            }
-        }
-        
-        for (int i = 0; i < divAnnCombineMapMSSEPOList.size(); i += BATCH_SIZE) {
-            int end = Math.min(i + BATCH_SIZE, divAnnCombineMapMSSEPOList.size());
-            List<DivAnnCombineMapMSSEPO> subList = divAnnCombineMapMSSEPOList.subList(i, end);
-            for (DivAnnCombineMapMSSEPO po : subList) {
-                divAnnCombineMapMSSEMapper.insert(po);
-            }
-        }
-        
-        DataBaseOperationUtils.batchInsertFrom(rightsRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(rightsDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(splitRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(splitDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(consolidRecord,mcConvEvntMapper::batchInsert,BATCH_SIZE);
-        DataBaseOperationUtils.batchInsertFrom(consolidDetailsRecord,mcCeventMapper::batchInsert,BATCH_SIZE);
-//        batchInsertDetailRecords(detailsRecord);
-//        batchInsertMainRecords(mainRecord);
-
-        rightsRecord.clear();
-        rightsDetailsRecord.clear();
-        splitRecord.clear();
-        splitDetailsRecord.clear();
-        consolidRecord.clear();
-        consolidDetailsRecord.clear();
-        divAnnRightsMapMSSEPOList.clear();
-        divAnnSplitMapMSSEPOList.clear();
-        divAnnCombineMapMSSEPOList.clear();// 内存回收
+        saveToOracleInBatches(mapList, recList, txnList, reltnList);
     }
 
-//    private void batchInsertDetailRecords(List<McCeventPO> detailsRecord) {
-//        if(detailsRecord.isEmpty()){
-//            return;
-//        }
-//
-//        for (int i = 0; i < detailsRecord.size(); i+=BATCH_SIZE) {
-//            int end = Math.min(i+BATCH_SIZE,detailsRecord.size());
-//            List<McCeventPO> mcCeventPOList = detailsRecord.subList(i, end);
-//            mcCeventMapper.batchInsert(mcCeventPOList);
-//        }
-//    }
-//
-//    private void batchInsertMainRecords(List<McConvEvntPO> mainRecord) {
-//
-//        if(mainRecord.isEmpty()){
-//            return;
-//        }
-//
-//        for (int i = 0; i < mainRecord.size(); i+=BATCH_SIZE) {
-//            int end = Math.min(i+BATCH_SIZE,mainRecord.size());
-//            List<McConvEvntPO> mcConvEvntPOList = mainRecord.subList(i, end);
-//            mcConvEvntMapper.batchInsert(mcConvEvntPOList);
-//        }
-//
-//    }
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleInBatches(List<CashVoucherMapMSSEPO> mapList,
+                                      List<McAcFundRecPO> recList,
+                                      List<McAcFundTxnRecPO> txnList,
+                                      List<McFundTpReltnPO> reltnList) {
+        batchInsertWithSize(mapList, cashVoucherMapMSSEMapper::insert);
+        batchInsertWithSize(txnList, mcAcFundTxnRecMapper::batchInsert);
+        batchInsertWithSize(recList, mcAcFundRecMapper::batchInsert);
+        batchInsertWithSize(reltnList, mcFundTpReltnMapper::batchInsert);
+    }
+
+    private <T> void batchInsertWithSize(List<T> list, java.util.function.Consumer<List<T>> insertFunction) {
+        if (list == null || list.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < list.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, list.size());
+            List<T> subList = list.subList(i, end);
+            insertFunction.accept(subList);
+        }
+    }
+
+    private String isChqAndIsTrnfrTrans(CashVoucherWithRequestDTO items, String type) {
+        if ("chq".equals(type)) {
+            if (!StringUtils.isEmpty(items.getMode())) {
+                return items.getMode().contains("CHQ") ? "Y" : "N";
+            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
+                return items.getWithdrawMode().contains("CHQ") ? "Y" : "N";
+            }
+            return "N";
+        } else {
+            if (!StringUtils.isEmpty(items.getMode())) {
+                return items.getMode().equals("3. INT TRF") ? "Y" : "N";
+            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
+                return items.getWithdrawMode().equals("3. INT TRF") ? "Y" : "N";
+            }
+            return "N";
+        }
+    }
+
+    private String isRevTrans(CashVoucherWithRequestDTO items) {
+        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
+            if (!items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus() != null && items.getStatus().contains("CAN")) {
+                return "Y";
+            }
+        }
+        return "N";
+    }
+
+    private String isTodayRevTrans(CashVoucherWithRequestDTO items) {
+        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
+            if (items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus() != null && items.getStatus().contains("CAN")) {
+                return "Y";
+            }
+        }
+        return "N";
+    }
+
+    private Long txnTypIdValueConvertFromCache(String code) {
+        if (code == null) return 1L;
+        String key = "M_" + code;
+        TransactionTypesPO po = transactionTypesCache.get(key);
+        if (po != null && po.getSignIndicator() != null) {
+            return "C".equals(po.getSignIndicator()) ? 1L : 6L;
+        }
+        return 1L;
+    }
+
+    private BigDecimal baseCcyEquAmtValueProcessFromCache(CashVoucherWithRequestDTO po) {
+        if (po.getCcy() == null || po.getConfirmationDate() == null || po.getAmount() == null) {
+            return BigDecimal.ZERO;
+        }
+        String key = po.getCcy() + "_" + po.getConfirmationDate().toLocalDate().toString();
+        ForexRatePO forexRatePO = forexRateCache.get(key);
+        if (forexRatePO != null && forexRatePO.getXRate() != null) {
+            return po.getAmount().multiply(forexRatePO.getXRate()).setScale(8, RoundingMode.HALF_UP);
+        }
+        return BigDecimal.ZERO;
+    }
+
+    private String txnTypActnCdeValueCovertFromCache(String code) {
+        if (code == null) return "";
+        String key = "M_" + code;
+        TransactionTypesPO po = transactionTypesCache.get(key);
+        if (po != null && po.getSignIndicator() != null) {
+            return "C".equals(po.getSignIndicator()) ? "IN" : "OUT";
+        }
+        return "";
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcAcFundTxn(List<McAcFundTxnRecPO> list) {
+        mcAcFundTxnRecMapper.batchInsert(list);
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcAcFundRec(List<McAcFundRecPO> list) {
+        mcAcFundRecMapper.batchInsert(list);
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcFundTpReltn(List<McFundTpReltnPO> list) {
+        mcFundTpReltnMapper.batchInsert(list);
+    }
 }
