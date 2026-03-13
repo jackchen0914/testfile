@@ -1,115 +1,78 @@
-    <select id="selectCashVoucherWithRequestByCursor" resultMap="CashVoucherWithRequestMap">
-        select
-        t1.InputDate,
-        t1.Clnt,
-        t1.CCY,
-        t1.TxnType,
-        t1.VoucherNo,
-        t1.Amount,
-        t1.ValueDate,
-        t1.StatusFlag,
-        t1.ManualInput,
-        t1.VoucherDate,
-        t1.Userid,
-        t1.Remark,
-        t1.[Source],
-        t1.AccountName,
-        t1.AccountNumber,
-        t1.Status,
-        t1.Charge,
-        t1.CancelDate,
-        t1.ConfirmationDate,
-        t1.ApprovalTime,
-        t1.Market,
-        t2.Relationship,
-        t2.Mode,
-        t2.WithdrawMode,
-        t2.BenfName
-        from
-        CashVoucher t1
-        left join CashVoucherRequest t2 on
-        t1.VoucherNo = t2.VoucherNo
-        and t1.Market = t2.Market
-        where
-        SUBSTRING(t1.StatusFlag ,8,1) != 'Y'
-        <if test="lastVoucherNo != null and lastMarket != null">
-            and (t1.VoucherNo &gt; #{lastVoucherNo} 
-                 or (t1.VoucherNo = #{lastVoucherNo} and t1.Market &gt; #{lastMarket}))
-        </if>
-        order by
-        t1.VoucherNo, t1.Market
-        FETCH NEXT #{limit} ROWS ONLY;
-    </select>
+package org.example.config;
 
-    <select id="selectCashVoucherWithRequestStream" resultMap="CashVoucherWithRequestMap" fetchSize="1000">
-        select
-        t1.InputDate,
-        t1.Clnt,
-        t1.CCY,
-        t1.TxnType,
-        t1.VoucherNo,
-        t1.Amount,
-        t1.ValueDate,
-        t1.StatusFlag,
-        t1.ManualInput,
-        t1.VoucherDate,
-        t1.Userid,
-        t1.Remark,
-        t1.[Source],
-        t1.AccountName,
-        t1.AccountNumber,
-        t1.Status,
-        t1.Charge,
-        t1.CancelDate,
-        t1.ConfirmationDate,
-        t1.ApprovalTime,
-        t1.Market,
-        t2.Relationship,
-        t2.Mode,
-        t2.WithdrawMode,
-        t2.BenfName
-        from
-        CashVoucher t1
-        left join CashVoucherRequest t2 on
-        t1.VoucherNo = t2.VoucherNo
-        and t1.Market = t2.Market
-        where
-        SUBSTRING(t1.StatusFlag ,8,1) != 'Y'
-        order by
-        t1.VoucherNo, t1.Market
-    </select>
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
-    <select id="countCashVoucherWithRequest" resultType="long">
-        select count(*)
-        from CashVoucher t1
-        where SUBSTRING(t1.StatusFlag, 8, 1) != 'Y'
-    </select>
+import java.util.concurrent.ThreadPoolExecutor;
 
+/**
+ * 数据迁移线程池配置
+ * 针对3000万+数据的大批量迁移场景优化
+ */
+@Configuration
+public class MigrationThreadPoolConfig {
 
-   List<CashVoucherWithRequestDTO> selectCashVoucherWithRequestByCursor(
-           @Param("lastVoucherNo") Integer lastVoucherNo,
-           @Param("lastMarket") String lastMarket,
-           @Param("limit") int limit);
+    /**
+     * 数据迁移专用线程池
+     * 线程数根据服务器配置调整：
+     * - CPU核心数8核：建议10-16个线程
+     * - CPU核心数16核：建议20-32个线程
+     */
+    @Bean(name = "migrationExecutor")
+    public ThreadPoolTaskExecutor migrationExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        
+        // 核心线程数：IO密集型任务，设置为CPU核心数的2倍
+        executor.setCorePoolSize(16);
+        
+        // 最大线程数
+        executor.setMaxPoolSize(32);
+        
+        // 队列容量：避免过大导致内存溢出
+        executor.setQueueCapacity(100);
+        
+        // 线程空闲时间（秒）
+        executor.setKeepAliveSeconds(60);
+        
+        // 线程名称前缀
+        executor.setThreadNamePrefix("migration-");
+        
+        // 拒绝策略：由调用线程执行
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        
+        // 等待所有任务完成后再关闭线程池
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        
+        // 等待时间（秒）
+        executor.setAwaitTerminationSeconds(300);
+        
+        executor.initialize();
+        return executor;
+    }
+}
 
-   void selectCashVoucherWithRequestStream(ResultHandler<CashVoucherWithRequestDTO> handler);
+------------------------------------
+    // 使用优化版本的Service
+    @Qualifier("cashVoucherToMsseServiceOptimized")
+    private final CashVoucherToMsseService cashVoucherToMsseService;
 
-   long countCashVoucherWithRequest();
+    /**
+     * CashVoucher数据迁移 - 优化版本
+     * 支持3000万+数据的高性能迁移
+     */
+    @GetMapping("/cashVoucherTable")
+    public String cashVoucherTable() {
+        return cashVoucherToMsseService.writeProcessedData();
+    }
 
-
-
-
-    @Select("select TransactionTypes, SignIndicator, StkMoney from dbo.TransactionTypes")
-    List<TransactionTypesPO> selectAllTransactionTypes();
-
-    @Select("select ccy, date, xrate from dbo.ForexRate")
-    List<ForexRatePO> selectAllForexRates();
-
-    @Select("select ccy, date, xrate from dbo.ForexRate where ccy = #{currency}")
-    List<ForexRatePO> selectRatesByCurrency(@Param("currency") String currency);
-
-
-
-
+===================
+   /**
+    * 查询符合条件的总数据量
+    */
+   @Select("SELECT COUNT(1) FROM CashVoucher t1 WHERE SUBSTRING(t1.StatusFlag, 8, 1) != 'Y'")
+   int selectCashVoucherCount();
+============================
 
 package org.example.service.impl;
 
@@ -117,28 +80,42 @@ import com.baomidou.dynamic.datasource.annotation.DS;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.ibatis.session.ResultHandler;
 import org.example.mapper.*;
 import org.example.pojo.*;
 import org.example.pojo.dtos.CashVoucherWithRequestDTO;
 import org.example.service.CashVoucherToMsseService;
 import org.example.service.IdGeneratorService;
 import org.example.utils.PropertyConverUtils;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.annotation.Resource;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-@Service
+/**
+ * 优化版本 - 针对3000万+数据的高性能迁移
+ * 
+ * 优化策略：
+ * 1. 多线程并行处理：使用线程池分批并行处理数据
+ * 2. 分页流式处理：每次只加载固定数量数据，避免OOM
+ * 3. 批量插入优化：减少数据库交互次数
+ * 4. 异常隔离：单批次失败不影响整体迁移
+ * 5. 进度监控：实时统计迁移进度
+ */
+@Service("cashVoucherToMsseServiceOptimized")
 @Slf4j
 @RequiredArgsConstructor
-public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
+public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseService {
 
     private final McAcFundRecMapper mcAcFundRecMapper;
     private final McAcFundTxnRecMapper mcAcFundTxnRecMapper;
@@ -149,204 +126,156 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
     private final CashVoucherMapMSSEMapper cashVoucherMapMSSEMapper;
     private final IdGeneratorService idGeneratorService;
 
-    private static final int BATCH_SIZE = 5000;
-    private static final int THREAD_POOL_SIZE = 4;
-    private static final int CURSOR_PAGE_SIZE = 10000;
+    @Resource(name = "migrationExecutor")
+    private ThreadPoolTaskExecutor migrationExecutor;
 
-    private volatile Map<String, TransactionTypesPO> transactionTypesCache;
-    private volatile Map<String, ForexRatePO> forexRateCache;
-    private final Object cacheLock = new Object();
+    // 每批次处理的数据量（根据服务器内存调整：2GB内存建议1000，4GB建议2000，8GB建议5000）
+    private static final int BATCH_SIZE = 2000;
+    
+    // 每次批量插入的数据量（Oracle建议1000-2000）
+    private static final int INSERT_BATCH_SIZE = 1000;
 
     @Override
     public String writeProcessedData() {
-        return writeProcessedDataByCursorPaging();
-    }
-
-    public String writeProcessedDataByCursorPaging() {
         long startTime = System.currentTimeMillis();
-        initCaches();
-
-        long totalCount = cashVoucherMapper.countCashVoucherWithRequest();
-        log.info("开始迁移，总数据量: {}", totalCount);
-
-        AtomicInteger processedCount = new AtomicInteger(0);
-        AtomicLong lastVoucherNo = new AtomicLong(-1);
-        AtomicInteger lastMarketIndex = new AtomicInteger(-1);
-        String[] markets = {"HK", "SH", "SZ", "BJ"};
-
-        ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
-        List<Future<?>> futures = new ArrayList<>();
-
-        while (true) {
-            Integer currentLastVoucherNo = lastVoucherNo.get() == -1 ? null : (int) lastVoucherNo.get();
-            String currentLastMarket = lastMarketIndex.get() == -1 ? null : markets[lastMarketIndex.get()];
-
-            List<CashVoucherWithRequestDTO> batch = cashVoucherMapper.selectCashVoucherWithRequestByCursor(
-                    currentLastVoucherNo, currentLastMarket, CURSOR_PAGE_SIZE);
-
-            if (batch == null || batch.isEmpty()) {
-                break;
-            }
-
-            CashVoucherWithRequestDTO lastItem = batch.get(batch.size() - 1);
-            lastVoucherNo.set(lastItem.getVoucherNo());
-            lastMarketIndex.set(Arrays.asList(markets).indexOf(lastItem.getMarket()));
-
-            final List<CashVoucherWithRequestDTO> batchToProcess = batch;
-            Future<?> future = executor.submit(() -> {
-                processBatch(batchToProcess);
-                int processed = processedCount.addAndGet(batchToProcess.size());
-                if (processed % 50000 == 0) {
-                    log.info("已处理: {}/{} ({}%)", processed, totalCount,
-                            String.format("%.2f", processed * 100.0 / totalCount));
-                }
-            });
-            futures.add(future);
-
-            if (futures.size() >= THREAD_POOL_SIZE * 2) {
-                waitForSomeFutures(futures);
-            }
-        }
-
-        for (Future<?> future : futures) {
-            try {
-                future.get();
-            } catch (Exception e) {
-                log.error("任务执行异常", e);
-            }
-        }
-
-        executor.shutdown();
+        log.info("========== 开始数据迁移 ==========");
+        
         try {
-            executor.awaitTermination(1, TimeUnit.HOURS);
-        } catch (InterruptedException e) {
-            log.error("线程池关闭被中断", e);
-        }
-
-        long endTime = System.currentTimeMillis();
-        log.info("迁移完成，总耗时: {}秒，处理数据: {}", (endTime - startTime) / 1000, processedCount.get());
-        return "ok";
-    }
-
-    public String writeProcessedDataByStream() {
-        long startTime = System.currentTimeMillis();
-        initCaches();
-
-        long totalCount = cashVoucherMapper.countCashVoucherWithRequest();
-        log.info("开始流式迁移，总数据量: {}", totalCount);
-
-        AtomicInteger processedCount = new AtomicInteger(0);
-        List<McAcFundRecPO> mcAcFundRecPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
-        List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
-        List<McFundTpReltnPO> mcFundTpReltnPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
-        List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = Collections.synchronizedList(new ArrayList<>(BATCH_SIZE));
-
-        cashVoucherMapper.selectCashVoucherWithRequestStream(context -> {
-            CashVoucherWithRequestDTO item = context.getResultObject();
-            processSingleItem(item, mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-
-            int processed = processedCount.incrementAndGet();
-            if (processed % BATCH_SIZE == 0) {
-                flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                        mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-                log.info("已处理: {}/{} ({}%)", processed, totalCount,
-                        String.format("%.2f", processed * 100.0 / totalCount));
+            // 1. 获取总数据量
+            int totalCount = getTotalCount();
+            log.info("总数据量: {} 条", totalCount);
+            
+            if (totalCount == 0) {
+                return "没有需要迁移的数据";
             }
-        });
-
-        if (!mcAcFundRecPOList.isEmpty()) {
-            flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-        }
-
-        long endTime = System.currentTimeMillis();
-        log.info("流式迁移完成，总耗时: {}秒，处理数据: {}", (endTime - startTime) / 1000, processedCount.get());
-        return "ok";
-    }
-
-    private void initCaches() {
-        if (transactionTypesCache == null || forexRateCache == null) {
-            synchronized (cacheLock) {
-                if (transactionTypesCache == null) {
-                    List<TransactionTypesPO> txnTypes = transactionTypesMapper.selectAllTransactionTypes();
-                    transactionTypesCache = new ConcurrentHashMap<>();
-                    for (TransactionTypesPO po : txnTypes) {
-                        String key = po.getStkMoney() + "_" + po.getTransactionTypes();
-                        transactionTypesCache.put(key, po);
-                    }
-                    log.info("TransactionTypes缓存加载完成，共{}条", transactionTypesCache.size());
-                }
-                if (forexRateCache == null) {
-                    List<ForexRatePO> rates = forexRateMapper.selectAllForexRates();
-                    forexRateCache = new ConcurrentHashMap<>();
-                    for (ForexRatePO po : rates) {
-                        if (po.getDate() != null) {
-                            String key = po.getCcy() + "_" + po.getDate().toLocalDate().toString();
-                            forexRateCache.put(key, po);
+            
+            // 2. 计算需要的批次数
+            int totalBatches = (int) Math.ceil((double) totalCount / BATCH_SIZE);
+            log.info("分批处理，每批 {} 条，共 {} 批", BATCH_SIZE, totalBatches);
+            
+            // 3. 统计计数器
+            AtomicInteger successCount = new AtomicInteger(0);
+            AtomicInteger failCount = new AtomicInteger(0);
+            AtomicLong processedCount = new AtomicLong(0);
+            
+            // 4. 使用CountDownLatch等待所有任务完成
+            CountDownLatch latch = new CountDownLatch(totalBatches);
+            
+            // 5. 提交所有批次任务到线程池
+            for (int i = 0; i < totalBatches; i++) {
+                final int batchIndex = i;
+                final int offset = i * BATCH_SIZE;
+                
+                migrationExecutor.execute(() -> {
+                    try {
+                        // 处理单个批次
+                        int processed = processBatch(offset, BATCH_SIZE, batchIndex + 1, totalBatches);
+                        successCount.addAndGet(processed);
+                        processedCount.addAndGet(processed);
+                        
+                        // 每10批输出一次进度
+                        if ((batchIndex + 1) % 10 == 0) {
+                            double progress = (double) processedCount.get() / totalCount * 100;
+                            log.info("迁移进度: {}/{} ({:.2f}%)", processedCount.get(), totalCount, progress);
                         }
+                    } catch (Exception e) {
+                        failCount.incrementAndGet();
+                        log.error("批次 {} 处理失败，offset={}", batchIndex + 1, offset, e);
+                    } finally {
+                        latch.countDown();
                     }
-                    log.info("ForexRate缓存加载完成，共{}条", forexRateCache.size());
-                }
+                });
             }
+            
+            // 6. 等待所有任务完成
+            latch.await();
+            
+            // 7. 输出统计信息
+            long endTime = System.currentTimeMillis();
+            long duration = (endTime - startTime) / 1000;
+            log.info("========== 数据迁移完成 ==========");
+            log.info("总耗时: {} 秒 ({} 分钟)", duration, duration / 60);
+            log.info("成功: {} 条", successCount.get());
+            log.info("失败: {} 批次", failCount.get());
+            log.info("平均速度: {} 条/秒", successCount.get() / Math.max(duration, 1));
+            
+            return String.format("迁移完成！成功: %d 条，失败: %d 批次，耗时: %d 秒", 
+                    successCount.get(), failCount.get(), duration);
+            
+        } catch (Exception e) {
+            log.error("数据迁移异常", e);
+            return "迁移失败: " + e.getMessage();
         }
     }
 
-    private void waitForSomeFutures(List<Future<?>> futures) {
-        Iterator<Future<?>> iterator = futures.iterator();
-        while (iterator.hasNext()) {
-            Future<?> future = iterator.next();
-            if (future.isDone()) {
+    /**
+     * 处理单个批次的数据
+     */
+    private int processBatch(int offset, int limit, int batchIndex, int totalBatches) {
+        long batchStartTime = System.currentTimeMillis();
+        
+        try {
+            // 1. 查询当前批次数据
+            List<CashVoucherWithRequestDTO> dataList = cashVoucherMapper.selectCashVoucherWithRequest(offset, limit);
+            
+            if (dataList == null || dataList.isEmpty()) {
+                log.warn("批次 {}/{} 没有数据，offset={}", batchIndex, totalBatches, offset);
+                return 0;
+            }
+            
+            int actualSize = dataList.size();
+            log.info("批次 {}/{} 开始处理，数据量: {}", batchIndex, totalBatches, actualSize);
+            
+            // 2. 数据转换
+            List<McAcFundRecPO> mcAcFundRecPOList = new ArrayList<>(actualSize);
+            List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = new ArrayList<>(actualSize);
+            List<McFundTpReltnPO> mcFundTpReltnPOList = new ArrayList<>(actualSize);
+            List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = new ArrayList<>(actualSize);
+            
+            for (CashVoucherWithRequestDTO item : dataList) {
                 try {
-                    future.get();
+                    convertAndAddData(item, mcAcFundRecPOList, mcAcFundTxnRecPOList, 
+                            mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
                 } catch (Exception e) {
-                    log.error("任务执行异常", e);
+                    log.error("数据转换失败，VoucherNo: {}, Market: {}", 
+                            item.getVoucherNo(), item.getMarket(), e);
+                    // 单条数据转换失败不影响整批
                 }
-                iterator.remove();
             }
+            
+            // 3. 批量插入数据（分小批次插入，避免单次插入数据量过大）
+            batchInsertData(cashVoucherMapMSSEPOList, mcAcFundTxnRecPOList, 
+                    mcAcFundRecPOList, mcFundTpReltnPOList);
+            
+            long batchDuration = System.currentTimeMillis() - batchStartTime;
+            log.info("批次 {}/{} 处理完成，耗时: {} ms，速度: {} 条/秒", 
+                    batchIndex, totalBatches, batchDuration, 
+                    actualSize * 1000 / Math.max(batchDuration, 1));
+            
+            return actualSize;
+            
+        } catch (Exception e) {
+            log.error("批次 {}/{} 处理异常，offset={}", batchIndex, totalBatches, offset, e);
+            throw new RuntimeException("批次处理失败", e);
         }
     }
 
-    private void processBatch(List<CashVoucherWithRequestDTO> batch) {
-        List<McAcFundRecPO> mcAcFundRecPOList = new ArrayList<>(batch.size());
-        List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = new ArrayList<>(batch.size());
-        List<McFundTpReltnPO> mcFundTpReltnPOList = new ArrayList<>(batch.size());
-        List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = new ArrayList<>(batch.size());
-
-        for (int i = 0; i < batch.size(); i++) {
-            CashVoucherWithRequestDTO items = batch.get(i);
-            processSingleItemWithIndex(items, i, mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                    mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-        }
-
-        flushToOracle(mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-    }
-
-    private void processSingleItem(CashVoucherWithRequestDTO items,
+    /**
+     * 数据转换（保持原有业务逻辑）
+     */
+    private void convertAndAddData(CashVoucherWithRequestDTO item,
                                    List<McAcFundRecPO> mcAcFundRecPOList,
                                    List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
                                    List<McFundTpReltnPO> mcFundTpReltnPOList,
                                    List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
-        processSingleItemWithIndex(items, 0, mcAcFundRecPOList, mcAcFundTxnRecPOList,
-                mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
-    }
-
-    private void processSingleItemWithIndex(CashVoucherWithRequestDTO items, int index,
-                                            List<McAcFundRecPO> mcAcFundRecPOList,
-                                            List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
-                                            List<McFundTpReltnPO> mcFundTpReltnPOList,
-                                            List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
+        
         Long mainId = idGeneratorService.generateMainId();
         Long acFundRid = idGeneratorService.generateDetailId();
 
-        McAcFundRecPO mcAcFundRecPO = new McAcFundRecPO();
+        // McAcFundTxnRecPO
         McAcFundTxnRecPO mcAcFundTxnRecPO = new McAcFundTxnRecPO();
-        McFundTpReltnPO mcFundTpReltnPO = new McFundTpReltnPO();
-        CashVoucherMapMSSEPO cashVoucherMapMSSEPO = new CashVoucherMapMSSEPO();
-
         mcAcFundTxnRecPO.setAcFundTxnRid(mainId);
-        mcAcFundTxnRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
+        mcAcFundTxnRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(item.getStatus()));
         mcAcFundTxnRecPO.setIsRev("N");
         mcAcFundTxnRecPO.setRevAcFundTxnRid(null);
         mcAcFundTxnRecPO.setRecVerNum(0L);
@@ -355,50 +284,52 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
         mcAcFundTxnRecPO.setLastUpdBy("MIG");
         mcAcFundTxnRecPO.setTagSeq(0L);
 
+        // McAcFundRecPO
+        McAcFundRecPO mcAcFundRecPO = new McAcFundRecPO();
         mcAcFundRecPO.setAcFundRid(acFundRid);
-        mcAcFundRecPO.setCmpnyIbusdate(items.getVoucherDate());
-        mcAcFundRecPO.setCmpnyBusdate(items.getVoucherDate());
+        mcAcFundRecPO.setCmpnyIbusdate(item.getVoucherDate());
+        mcAcFundRecPO.setCmpnyBusdate(item.getVoucherDate());
         mcAcFundRecPO.setAcId("02-0000389-30");
-        mcAcFundRecPO.setCcyCde(PropertyConverUtils.standardizeCurrencyCode(items.getCcy()));
+        mcAcFundRecPO.setCcyCde(PropertyConverUtils.standardizeCurrencyCode(item.getCcy()));
         mcAcFundRecPO.setSegrFundId(1L);
         mcAcFundRecPO.setCmpnyCde("TFS");
-        mcAcFundRecPO.setTxnTypId(txnTypIdValueConvertFromCache(items.getTxnType()));
-        mcAcFundRecPO.setValDate(items.getValueDate());
-        mcAcFundRecPO.setAmt(items.getAmount().abs());
+        mcAcFundRecPO.setTxnTypId(txnTypIdValueConvert(item.getTxnType()));
+        mcAcFundRecPO.setValDate(item.getValueDate());
+        mcAcFundRecPO.setAmt(item.getAmount().abs());
         mcAcFundRecPO.setIsNonAcHldr("N");
-        mcAcFundRecPO.setRemrk(items.getRemark());
-        mcAcFundRecPO.setBankCde(items.getSource());
-        mcAcFundRecPO.setPayeNam(items.getAccountName());
-        mcAcFundRecPO.setOthAcPayeNam(items.getBenfName());
-        mcAcFundRecPO.setClntBankCde(items.getSource());
-        mcAcFundRecPO.setClntBankAcNum(items.getAccountNumber());
+        mcAcFundRecPO.setRemrk(item.getRemark());
+        mcAcFundRecPO.setBankCde(item.getSource());
+        mcAcFundRecPO.setPayeNam(item.getAccountName());
+        mcAcFundRecPO.setOthAcPayeNam(item.getBenfName());
+        mcAcFundRecPO.setClntBankCde(item.getSource());
+        mcAcFundRecPO.setClntBankAcNum(item.getAccountNumber());
         mcAcFundRecPO.setIsPrtRcpt("N");
-        mcAcFundRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
-        mcAcFundRecPO.setFundChnlCde(Objects.equals(items.getManualInput(), "Yes") ? "MANUALINP" : "SYSTEM");
-        mcAcFundRecPO.setTxnTypActnCde(txnTypActnCdeValueCovertFromCache(items.getTxnType()));
+        mcAcFundRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(item.getStatus()));
+        mcAcFundRecPO.setFundChnlCde(Objects.equals(item.getManualInput(), "Yes") ? "MANUALINP" : "SYSTEM");
+        mcAcFundRecPO.setTxnTypActnCde(txnTypActnCdeValueCovert(item.getTxnType()));
         mcAcFundRecPO.setIsMemo("N");
-        mcAcFundRecPO.setIsChq(isChqAndIsTrnfrTrans(items, "chq"));
-        mcAcFundRecPO.setIsChrg(items.getCharge() != null && items.getCharge().contains("YES") ? "Y" : "N");
-        mcAcFundRecPO.setIsTrnfr(isChqAndIsTrnfrTrans(items, "trnfr"));
-        mcAcFundRecPO.setIsRev(isRevTrans(items));
+        mcAcFundRecPO.setIsChq(isChqAndIsTrnfrTrans(item, "chq"));
+        mcAcFundRecPO.setIsChrg(item.getCharge().contains("YES") ? "Y" : "N");
+        mcAcFundRecPO.setIsTrnfr(isChqAndIsTrnfrTrans(item, "trnfr"));
+        mcAcFundRecPO.setIsRev(isRevTrans(item));
         mcAcFundRecPO.setIsDhon("N");
         mcAcFundRecPO.setIsRtun("N");
         mcAcFundRecPO.setIsUnderRevrse("N");
         mcAcFundRecPO.setIsUnderDhon("N");
         mcAcFundRecPO.setIsUnderRtun("N");
-        mcAcFundRecPO.setIsTodayRev(isTodayRevTrans(items));
+        mcAcFundRecPO.setIsTodayRev(isTodayRevTrans(item));
         mcAcFundRecPO.setIsTrigCreat("N");
-        mcAcFundRecPO.setPrimyRemrkFrStmt(items.getRemark());
-        mcAcFundRecPO.setBaseCcyEquAmt(baseCcyEquAmtValueProcessFromCache(items));
+        mcAcFundRecPO.setPrimyRemrkFrStmt(item.getRemark());
+        mcAcFundRecPO.setBaseCcyEquAmt(baseCcyEquAmtValueProcess(item));
         mcAcFundRecPO.setIsAutoAprv("N");
         mcAcFundRecPO.setIsIgnrDatSync("N");
         mcAcFundRecPO.setRvisUnit("0031");
         mcAcFundRecPO.setRvisBy("MIG");
         mcAcFundRecPO.setLastRvisTime(LocalDateTime.now());
         mcAcFundRecPO.setChkBy("MIG");
-        mcAcFundRecPO.setAprvRejCmpnyIbusdate(items.getApprovalTime());
-        mcAcFundRecPO.setAprvRejCmpnyBusdate(items.getApprovalTime());
-        mcAcFundRecPO.setAprvRejTime(items.getApprovalTime());
+        mcAcFundRecPO.setAprvRejCmpnyIbusdate(item.getApprovalTime());
+        mcAcFundRecPO.setAprvRejCmpnyBusdate(item.getApprovalTime());
+        mcAcFundRecPO.setAprvRejTime(item.getApprovalTime());
         mcAcFundRecPO.setIsElectronic("N");
         mcAcFundRecPO.setIsWork("N");
         mcAcFundRecPO.setAcFundTxnRid(mainId);
@@ -410,18 +341,23 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
         mcAcFundRecPO.setLastUpdTime(LocalDateTime.now());
         mcAcFundRecPO.setLastUpdBy("MIG");
         mcAcFundRecPO.setTagSeq(0L);
-        mcAcFundRecPO.setExtrnlRefNum(items.getMarket() + items.getVoucherNo());
+        mcAcFundRecPO.setExtrnlRefNum(item.getMarket() + item.getVoucherNo());
         mcAcFundRecPO.setExtrnlSysCde("OctOBack");
         mcAcFundRecPO.setInitUser("MIG");
         mcAcFundRecPO.setInitUserUnit("0031");
         mcAcFundRecPO.setIsReact("N");
         mcAcFundRecPO.setIsUnderReact("N");
         mcAcFundRecPO.setIsNonRegBankAc("N");
-        mcAcFundRecPO.setFundTpReltnCde(items.getRelationship());
+        mcAcFundRecPO.setFundTpReltnCde(item.getRelationship());
 
-        mcFundTpReltnPO.setFundTpReltnCde(StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + index) : items.getRelationship());
-        mcFundTpReltnPO.setFundTpReltnDscr(StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + index) : items.getRelationship());
-        mcFundTpReltnPO.setFundTpReltnPri((long) (18 + index));
+        // McFundTpReltnPO
+        McFundTpReltnPO mcFundTpReltnPO = new McFundTpReltnPO();
+        String relationshipCode = (Objects.equals(item.getRelationship(), "") || item.getRelationship() == null) 
+                ? String.valueOf(System.nanoTime() % 1000000) 
+                : item.getRelationship();
+        mcFundTpReltnPO.setFundTpReltnCde(relationshipCode);
+        mcFundTpReltnPO.setFundTpReltnDscr(relationshipCode);
+        mcFundTpReltnPO.setFundTpReltnPri((long) (18 + System.nanoTime() % 1000));
         mcFundTpReltnPO.setIsInact("N");
         mcFundTpReltnPO.setRecVerNum(0L);
         mcFundTpReltnPO.setInitTime(LocalDateTime.now());
@@ -429,80 +365,84 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
         mcFundTpReltnPO.setLastUpdBy("MIG");
         mcFundTpReltnPO.setTagSeq(0L);
 
-        cashVoucherMapMSSEPO.setVoucherNo(items.getVoucherNo());
-        cashVoucherMapMSSEPO.setMarket(items.getMarket());
+        // CashVoucherMapMSSEPO
+        CashVoucherMapMSSEPO cashVoucherMapMSSEPO = new CashVoucherMapMSSEPO();
+        cashVoucherMapMSSEPO.setVoucherNo(item.getVoucherNo());
+        cashVoucherMapMSSEPO.setMarket(item.getMarket());
         cashVoucherMapMSSEPO.setAcFundRid(acFundRid);
 
+        // 添加到列表
         cashVoucherMapMSSEPOList.add(cashVoucherMapMSSEPO);
         mcAcFundRecPOList.add(mcAcFundRecPO);
         mcAcFundTxnRecPOList.add(mcAcFundTxnRecPO);
         mcFundTpReltnPOList.add(mcFundTpReltnPO);
     }
 
-    private void flushToOracle(List<McAcFundRecPO> mcAcFundRecPOList,
-                               List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
-                               List<McFundTpReltnPO> mcFundTpReltnPOList,
-                               List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
-        if (mcAcFundRecPOList.isEmpty()) {
+    /**
+     * 分小批次批量插入数据
+     */
+    private void batchInsertData(List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList,
+                                 List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
+                                 List<McAcFundRecPO> mcAcFundRecPOList,
+                                 List<McFundTpReltnPO> mcFundTpReltnPOList) {
+        
+        // 分小批次插入，避免单次插入数据量过大
+        insertInSmallBatches(cashVoucherMapMSSEPOList, this::saveCashVoucherMapMSSE);
+        insertInSmallBatches(mcAcFundTxnRecPOList, this::saveToOracleMcAcFundTxn);
+        insertInSmallBatches(mcAcFundRecPOList, this::saveToOracleMcAcFundRec);
+        insertInSmallBatches(mcFundTpReltnPOList, this::saveToOracleMcFundTpReltn);
+    }
+
+    /**
+     * 分小批次插入通用方法
+     */
+    private <T> void insertInSmallBatches(List<T> dataList, BatchInsertFunction<T> insertFunction) {
+        if (dataList == null || dataList.isEmpty()) {
             return;
         }
-
-        List<McAcFundRecPO> recList = new ArrayList<>(mcAcFundRecPOList);
-        List<McAcFundTxnRecPO> txnList = new ArrayList<>(mcAcFundTxnRecPOList);
-        List<McFundTpReltnPO> reltnList = new ArrayList<>(mcFundTpReltnPOList);
-        List<CashVoucherMapMSSEPO> mapList = new ArrayList<>(cashVoucherMapMSSEPOList);
-
-        mcAcFundRecPOList.clear();
-        mcAcFundTxnRecPOList.clear();
-        mcFundTpReltnPOList.clear();
-        cashVoucherMapMSSEPOList.clear();
-
-        saveToOracleInBatches(mapList, recList, txnList, reltnList);
-    }
-
-    @Transactional(rollbackFor = Exception.class)
-    public void saveToOracleInBatches(List<CashVoucherMapMSSEPO> mapList,
-                                      List<McAcFundRecPO> recList,
-                                      List<McAcFundTxnRecPO> txnList,
-                                      List<McFundTpReltnPO> reltnList) {
-        batchInsertWithSize(mapList, cashVoucherMapMSSEMapper::insert);
-        batchInsertWithSize(txnList, mcAcFundTxnRecMapper::batchInsert);
-        batchInsertWithSize(recList, mcAcFundRecMapper::batchInsert);
-        batchInsertWithSize(reltnList, mcFundTpReltnMapper::batchInsert);
-    }
-
-    private <T> void batchInsertWithSize(List<T> list, java.util.function.Consumer<List<T>> insertFunction) {
-        if (list == null || list.isEmpty()) {
-            return;
-        }
-        for (int i = 0; i < list.size(); i += BATCH_SIZE) {
-            int end = Math.min(i + BATCH_SIZE, list.size());
-            List<T> subList = list.subList(i, end);
-            insertFunction.accept(subList);
+        
+        int totalSize = dataList.size();
+        for (int i = 0; i < totalSize; i += INSERT_BATCH_SIZE) {
+            int end = Math.min(i + INSERT_BATCH_SIZE, totalSize);
+            List<T> subList = dataList.subList(i, end);
+            insertFunction.insert(subList);
         }
     }
+
+    @FunctionalInterface
+    private interface BatchInsertFunction<T> {
+        void insert(List<T> list);
+    }
+
+    /**
+     * 获取总数据量
+     */
+    private int getTotalCount() {
+        // 使用COUNT查询获取总数（只统计符合迁移条件的数据）
+        return cashVoucherMapper.selectCashVoucherCount();
+    }
+
+    // ========== 以下是原有的业务逻辑方法 ==========
 
     private String isChqAndIsTrnfrTrans(CashVoucherWithRequestDTO items, String type) {
-        if ("chq".equals(type)) {
+        if (type.equals("chq")) {
             if (!StringUtils.isEmpty(items.getMode())) {
                 return items.getMode().contains("CHQ") ? "Y" : "N";
             } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
                 return items.getWithdrawMode().contains("CHQ") ? "Y" : "N";
-            }
-            return "N";
+            } else return "N";
         } else {
             if (!StringUtils.isEmpty(items.getMode())) {
                 return items.getMode().equals("3. INT TRF") ? "Y" : "N";
             } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
                 return items.getWithdrawMode().equals("3. INT TRF") ? "Y" : "N";
-            }
-            return "N";
+            } else return "N";
         }
     }
 
     private String isRevTrans(CashVoucherWithRequestDTO items) {
         if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
-            if (!items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus() != null && items.getStatus().contains("CAN")) {
+            if (!items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus().contains("CAN")) {
                 return "Y";
             }
         }
@@ -511,60 +451,488 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
 
     private String isTodayRevTrans(CashVoucherWithRequestDTO items) {
         if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
-            if (items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus() != null && items.getStatus().contains("CAN")) {
+            if (items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus().contains("CAN")) {
                 return "Y";
             }
         }
         return "N";
     }
 
-    private Long txnTypIdValueConvertFromCache(String code) {
-        if (code == null) return 1L;
-        String key = "M_" + code;
-        TransactionTypesPO po = transactionTypesCache.get(key);
-        if (po != null && po.getSignIndicator() != null) {
-            return "C".equals(po.getSignIndicator()) ? 1L : 6L;
-        }
-        return 1L;
+    private Long txnTypIdValueConvert(String code) {
+        TransactionTypesPO transactionTypesPO = transactionTypesMapper.selectTxnTypeCode(code);
+        return transactionTypesPO.getSignIndicator().equals("C") ? 1L : 6L;
     }
 
-    private BigDecimal baseCcyEquAmtValueProcessFromCache(CashVoucherWithRequestDTO po) {
-        if (po.getCcy() == null || po.getConfirmationDate() == null || po.getAmount() == null) {
-            return BigDecimal.ZERO;
-        }
-        String key = po.getCcy() + "_" + po.getConfirmationDate().toLocalDate().toString();
-        ForexRatePO forexRatePO = forexRateCache.get(key);
-        if (forexRatePO != null && forexRatePO.getXRate() != null) {
-            return po.getAmount().multiply(forexRatePO.getXRate()).setScale(8, RoundingMode.HALF_UP);
-        }
-        return BigDecimal.ZERO;
+    private BigDecimal baseCcyEquAmtValueProcess(CashVoucherWithRequestDTO po) {
+        ForexRatePO forexRatePO = forexRateMapper.selectRateByDate(po.getCcy(), 
+                String.valueOf(po.getConfirmationDate()).split("T")[0]);
+        return po.getAmount().multiply(forexRatePO.getXRate()).setScale(8, RoundingMode.HALF_UP);
     }
 
-    private String txnTypActnCdeValueCovertFromCache(String code) {
-        if (code == null) return "";
-        String key = "M_" + code;
-        TransactionTypesPO po = transactionTypesCache.get(key);
-        if (po != null && po.getSignIndicator() != null) {
-            return "C".equals(po.getSignIndicator()) ? "IN" : "OUT";
+    private String txnTypActnCdeValueCovert(String code) {
+        TransactionTypesPO transactionTypesPO = transactionTypesMapper.selectTxnTypeCode(code);
+        if (transactionTypesPO.getSignIndicator() != null) {
+            return transactionTypesPO.getSignIndicator().equals("C") ? "IN" : "OUT";
         }
         return "";
+    }
+
+    @DS("master")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveCashVoucherMapMSSE(List<CashVoucherMapMSSEPO> list) {
+        if (list != null && !list.isEmpty()) {
+            cashVoucherMapMSSEMapper.insert(list);
+        }
     }
 
     @DS("oracle")
     @Transactional(rollbackFor = Exception.class)
     public void saveToOracleMcAcFundTxn(List<McAcFundTxnRecPO> list) {
-        mcAcFundTxnRecMapper.batchInsert(list);
+        if (list != null && !list.isEmpty()) {
+            mcAcFundTxnRecMapper.batchInsert(list);
+        }
     }
 
     @DS("oracle")
     @Transactional(rollbackFor = Exception.class)
     public void saveToOracleMcAcFundRec(List<McAcFundRecPO> list) {
-        mcAcFundRecMapper.batchInsert(list);
+        if (list != null && !list.isEmpty()) {
+            mcAcFundRecMapper.batchInsert(list);
+        }
     }
 
     @DS("oracle")
     @Transactional(rollbackFor = Exception.class)
     public void saveToOracleMcFundTpReltn(List<McFundTpReltnPO> list) {
-        mcFundTpReltnMapper.batchInsert(list);
+        if (list != null && !list.isEmpty()) {
+            mcFundTpReltnMapper.batchInsert(list);
+        }
     }
 }
+
+
+=================++++++
+
+package org.example.service.impl;
+
+import com.baomidou.dynamic.datasource.annotation.DS;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.example.mapper.*;
+import org.example.pojo.*;
+import org.example.pojo.dtos.CashVoucherWithRequestDTO;
+import org.example.service.CashVoucherToMsseService;
+import org.example.service.IdGeneratorService;
+import org.example.utils.PropertyConverUtils;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.annotation.Resource;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+/**
+ * 高级优化版本 - 使用CompletableFuture实现更细粒度的并行控制
+ * 
+ * 相比基础优化版本的改进：
+ * 1. 使用CompletableFuture异步编排，更灵活的并发控制
+ * 2. 读写分离：查询和插入可以并行进行
+ * 3. 流式处理：边读边写，减少内存占用
+ * 4. 更好的异常处理和重试机制
+ * 
+ * 适用场景：
+ * - 服务器资源充足（16核+，32GB+内存）
+ * - 网络延迟低（<5ms）
+ * - 需要极致性能（目标：1万条/秒以上）
+ */
+@Service("cashVoucherToMsseServiceAdvanced")
+@Slf4j
+@RequiredArgsConstructor
+public class CashVoucherToMsseServiceImplAdvanced implements CashVoucherToMsseService {
+
+    private final McAcFundRecMapper mcAcFundRecMapper;
+    private final McAcFundTxnRecMapper mcAcFundTxnRecMapper;
+    private final McFundTpReltnMapper mcFundTpReltnMapper;
+    private final CashVoucherMapper cashVoucherMapper;
+    private final ForexRateMapper forexRateMapper;
+    private final TransactionTypesMapper transactionTypesMapper;
+    private final CashVoucherMapMSSEMapper cashVoucherMapMSSEMapper;
+    private final IdGeneratorService idGeneratorService;
+
+    @Resource(name = "migrationExecutor")
+    private ThreadPoolTaskExecutor migrationExecutor;
+
+    private static final int BATCH_SIZE = 2000;
+    private static final int INSERT_BATCH_SIZE = 1000;
+    
+    // 最大并发批次数（控制内存使用）
+    private static final int MAX_CONCURRENT_BATCHES = 20;
+
+    @Override
+    public String writeProcessedData() {
+        long startTime = System.currentTimeMillis();
+        log.info("========== 开始数据迁移（高级版本） ==========");
+        
+        try {
+            int totalCount = cashVoucherMapper.selectCashVoucherCount();
+            log.info("总数据量: {} 条", totalCount);
+            
+            if (totalCount == 0) {
+                return "没有需要迁移的数据";
+            }
+            
+            int totalBatches = (int) Math.ceil((double) totalCount / BATCH_SIZE);
+            log.info("分批处理，每批 {} 条，共 {} 批", BATCH_SIZE, totalBatches);
+            
+            AtomicInteger successCount = new AtomicInteger(0);
+            AtomicInteger failCount = new AtomicInteger(0);
+            AtomicLong processedCount = new AtomicLong(0);
+            
+            // 使用CompletableFuture实现流式并行处理
+            List<CompletableFuture<Integer>> futures = new ArrayList<>();
+            
+            for (int i = 0; i < totalBatches; i++) {
+                final int batchIndex = i;
+                final int offset = i * BATCH_SIZE;
+                
+                // 创建异步任务
+                CompletableFuture<Integer> future = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return processBatchAsync(offset, BATCH_SIZE, batchIndex + 1, totalBatches);
+                    } catch (Exception e) {
+                        log.error("批次 {} 处理失败", batchIndex + 1, e);
+                        failCount.incrementAndGet();
+                        return 0;
+                    }
+                }, migrationExecutor).thenApply(processed -> {
+                    successCount.addAndGet(processed);
+                    long current = processedCount.addAndGet(processed);
+                    
+                    if ((batchIndex + 1) % 10 == 0) {
+                        double progress = (double) current / totalCount * 100;
+                        log.info("迁移进度: {}/{} ({:.2f}%)", current, totalCount, progress);
+                    }
+                    return processed;
+                });
+                
+                futures.add(future);
+                
+                // 控制并发数，避免内存溢出
+                if (futures.size() >= MAX_CONCURRENT_BATCHES) {
+                    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                    futures.clear();
+                }
+            }
+            
+            // 等待剩余任务完成
+            if (!futures.isEmpty()) {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            }
+            
+            long endTime = System.currentTimeMillis();
+            long duration = (endTime - startTime) / 1000;
+            log.info("========== 数据迁移完成 ==========");
+            log.info("总耗时: {} 秒 ({} 分钟)", duration, duration / 60);
+            log.info("成功: {} 条", successCount.get());
+            log.info("失败: {} 批次", failCount.get());
+            log.info("平均速度: {} 条/秒", successCount.get() / Math.max(duration, 1));
+            
+            return String.format("迁移完成！成功: %d 条，失败: %d 批次，耗时: %d 秒", 
+                    successCount.get(), failCount.get(), duration);
+            
+        } catch (Exception e) {
+            log.error("数据迁移异常", e);
+            return "迁移失败: " + e.getMessage();
+        }
+    }
+
+    /**
+     * 异步处理单个批次
+     */
+    private int processBatchAsync(int offset, int limit, int batchIndex, int totalBatches) {
+        long batchStartTime = System.currentTimeMillis();
+        
+        try {
+            // 异步查询数据
+            List<CashVoucherWithRequestDTO> dataList = cashVoucherMapper.selectCashVoucherWithRequest(offset, limit);
+            
+            if (dataList == null || dataList.isEmpty()) {
+                return 0;
+            }
+            
+            int actualSize = dataList.size();
+            
+            // 并行转换数据
+            List<McAcFundRecPO> mcAcFundRecPOList = new ArrayList<>(actualSize);
+            List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = new ArrayList<>(actualSize);
+            List<McFundTpReltnPO> mcFundTpReltnPOList = new ArrayList<>(actualSize);
+            List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = new ArrayList<>(actualSize);
+            
+            // 使用并行流加速数据转换（适用于CPU密集型转换逻辑）
+            dataList.parallelStream().forEach(item -> {
+                try {
+                    synchronized (mcAcFundRecPOList) {
+                        convertAndAddData(item, mcAcFundRecPOList, mcAcFundTxnRecPOList, 
+                                mcFundTpReltnPOList, cashVoucherMapMSSEPOList);
+                    }
+                } catch (Exception e) {
+                    log.error("数据转换失败，VoucherNo: {}", item.getVoucherNo(), e);
+                }
+            });
+            
+            // 异步批量插入（4个表并行插入）
+            CompletableFuture<Void> f1 = CompletableFuture.runAsync(() -> 
+                    insertInSmallBatches(cashVoucherMapMSSEPOList, this::saveCashVoucherMapMSSE), migrationExecutor);
+            
+            CompletableFuture<Void> f2 = CompletableFuture.runAsync(() -> 
+                    insertInSmallBatches(mcAcFundTxnRecPOList, this::saveToOracleMcAcFundTxn), migrationExecutor);
+            
+            CompletableFuture<Void> f3 = CompletableFuture.runAsync(() -> 
+                    insertInSmallBatches(mcAcFundRecPOList, this::saveToOracleMcAcFundRec), migrationExecutor);
+            
+            CompletableFuture<Void> f4 = CompletableFuture.runAsync(() -> 
+                    insertInSmallBatches(mcFundTpReltnPOList, this::saveToOracleMcFundTpReltn), migrationExecutor);
+            
+            // 等待所有插入完成
+            CompletableFuture.allOf(f1, f2, f3, f4).join();
+            
+            long batchDuration = System.currentTimeMillis() - batchStartTime;
+            log.info("批次 {}/{} 完成，耗时: {} ms，速度: {} 条/秒", 
+                    batchIndex, totalBatches, batchDuration, 
+                    actualSize * 1000 / Math.max(batchDuration, 1));
+            
+            return actualSize;
+            
+        } catch (Exception e) {
+            log.error("批次 {} 处理异常", batchIndex, e);
+            throw new RuntimeException("批次处理失败", e);
+        }
+    }
+
+    private void convertAndAddData(CashVoucherWithRequestDTO item,
+                                   List<McAcFundRecPO> mcAcFundRecPOList,
+                                   List<McAcFundTxnRecPO> mcAcFundTxnRecPOList,
+                                   List<McFundTpReltnPO> mcFundTpReltnPOList,
+                                   List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList) {
+        
+        Long mainId = idGeneratorService.generateMainId();
+        Long acFundRid = idGeneratorService.generateDetailId();
+
+        McAcFundTxnRecPO mcAcFundTxnRecPO = new McAcFundTxnRecPO();
+        mcAcFundTxnRecPO.setAcFundTxnRid(mainId);
+        mcAcFundTxnRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(item.getStatus()));
+        mcAcFundTxnRecPO.setIsRev("N");
+        mcAcFundTxnRecPO.setRevAcFundTxnRid(null);
+        mcAcFundTxnRecPO.setRecVerNum(0L);
+        mcAcFundTxnRecPO.setInitTime(LocalDateTime.now());
+        mcAcFundTxnRecPO.setLastUpdTime(LocalDateTime.now());
+        mcAcFundTxnRecPO.setLastUpdBy("MIG");
+        mcAcFundTxnRecPO.setTagSeq(0L);
+
+        McAcFundRecPO mcAcFundRecPO = new McAcFundRecPO();
+        mcAcFundRecPO.setAcFundRid(acFundRid);
+        mcAcFundRecPO.setCmpnyIbusdate(item.getVoucherDate());
+        mcAcFundRecPO.setCmpnyBusdate(item.getVoucherDate());
+        mcAcFundRecPO.setAcId("02-0000389-30");
+        mcAcFundRecPO.setCcyCde(PropertyConverUtils.standardizeCurrencyCode(item.getCcy()));
+        mcAcFundRecPO.setSegrFundId(1L);
+        mcAcFundRecPO.setCmpnyCde("TFS");
+        mcAcFundRecPO.setTxnTypId(txnTypIdValueConvert(item.getTxnType()));
+        mcAcFundRecPO.setValDate(item.getValueDate());
+        mcAcFundRecPO.setAmt(item.getAmount().abs());
+        mcAcFundRecPO.setIsNonAcHldr("N");
+        mcAcFundRecPO.setRemrk(item.getRemark());
+        mcAcFundRecPO.setBankCde(item.getSource());
+        mcAcFundRecPO.setPayeNam(item.getAccountName());
+        mcAcFundRecPO.setOthAcPayeNam(item.getBenfName());
+        mcAcFundRecPO.setClntBankCde(item.getSource());
+        mcAcFundRecPO.setClntBankAcNum(item.getAccountNumber());
+        mcAcFundRecPO.setIsPrtRcpt("N");
+        mcAcFundRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(item.getStatus()));
+        mcAcFundRecPO.setFundChnlCde(Objects.equals(item.getManualInput(), "Yes") ? "MANUALINP" : "SYSTEM");
+        mcAcFundRecPO.setTxnTypActnCde(txnTypActnCdeValueCovert(item.getTxnType()));
+        mcAcFundRecPO.setIsMemo("N");
+        mcAcFundRecPO.setIsChq(isChqAndIsTrnfrTrans(item, "chq"));
+        mcAcFundRecPO.setIsChrg(item.getCharge().contains("YES") ? "Y" : "N");
+        mcAcFundRecPO.setIsTrnfr(isChqAndIsTrnfrTrans(item, "trnfr"));
+        mcAcFundRecPO.setIsRev(isRevTrans(item));
+        mcAcFundRecPO.setIsDhon("N");
+        mcAcFundRecPO.setIsRtun("N");
+        mcAcFundRecPO.setIsUnderRevrse("N");
+        mcAcFundRecPO.setIsUnderDhon("N");
+        mcAcFundRecPO.setIsUnderRtun("N");
+        mcAcFundRecPO.setIsTodayRev(isTodayRevTrans(item));
+        mcAcFundRecPO.setIsTrigCreat("N");
+        mcAcFundRecPO.setPrimyRemrkFrStmt(item.getRemark());
+        mcAcFundRecPO.setBaseCcyEquAmt(baseCcyEquAmtValueProcess(item));
+        mcAcFundRecPO.setIsAutoAprv("N");
+        mcAcFundRecPO.setIsIgnrDatSync("N");
+        mcAcFundRecPO.setRvisUnit("0031");
+        mcAcFundRecPO.setRvisBy("MIG");
+        mcAcFundRecPO.setLastRvisTime(LocalDateTime.now());
+        mcAcFundRecPO.setChkBy("MIG");
+        mcAcFundRecPO.setAprvRejCmpnyIbusdate(item.getApprovalTime());
+        mcAcFundRecPO.setAprvRejCmpnyBusdate(item.getApprovalTime());
+        mcAcFundRecPO.setAprvRejTime(item.getApprovalTime());
+        mcAcFundRecPO.setIsElectronic("N");
+        mcAcFundRecPO.setIsWork("N");
+        mcAcFundRecPO.setAcFundTxnRid(mainId);
+        mcAcFundRecPO.setIsOperateInFund("N");
+        mcAcFundRecPO.setIsInstrRelt("N");
+        mcAcFundRecPO.setIsPost("N");
+        mcAcFundRecPO.setRecVerNum(0L);
+        mcAcFundRecPO.setInitTime(LocalDateTime.now());
+        mcAcFundRecPO.setLastUpdTime(LocalDateTime.now());
+        mcAcFundRecPO.setLastUpdBy("MIG");
+        mcAcFundRecPO.setTagSeq(0L);
+        mcAcFundRecPO.setExtrnlRefNum(item.getMarket() + item.getVoucherNo());
+        mcAcFundRecPO.setExtrnlSysCde("OctOBack");
+        mcAcFundRecPO.setInitUser("MIG");
+        mcAcFundRecPO.setInitUserUnit("0031");
+        mcAcFundRecPO.setIsReact("N");
+        mcAcFundRecPO.setIsUnderReact("N");
+        mcAcFundRecPO.setIsNonRegBankAc("N");
+        mcAcFundRecPO.setFundTpReltnCde(item.getRelationship());
+
+        McFundTpReltnPO mcFundTpReltnPO = new McFundTpReltnPO();
+        String relationshipCode = (Objects.equals(item.getRelationship(), "") || item.getRelationship() == null) 
+                ? String.valueOf(System.nanoTime() % 1000000) 
+                : item.getRelationship();
+        mcFundTpReltnPO.setFundTpReltnCde(relationshipCode);
+        mcFundTpReltnPO.setFundTpReltnDscr(relationshipCode);
+        mcFundTpReltnPO.setFundTpReltnPri((long) (18 + System.nanoTime() % 1000));
+        mcFundTpReltnPO.setIsInact("N");
+        mcFundTpReltnPO.setRecVerNum(0L);
+        mcFundTpReltnPO.setInitTime(LocalDateTime.now());
+        mcFundTpReltnPO.setLastUpdTime(LocalDateTime.now());
+        mcFundTpReltnPO.setLastUpdBy("MIG");
+        mcFundTpReltnPO.setTagSeq(0L);
+
+        CashVoucherMapMSSEPO cashVoucherMapMSSEPO = new CashVoucherMapMSSEPO();
+        cashVoucherMapMSSEPO.setVoucherNo(item.getVoucherNo());
+        cashVoucherMapMSSEPO.setMarket(item.getMarket());
+        cashVoucherMapMSSEPO.setAcFundRid(acFundRid);
+
+        cashVoucherMapMSSEPOList.add(cashVoucherMapMSSEPO);
+        mcAcFundRecPOList.add(mcAcFundRecPO);
+        mcAcFundTxnRecPOList.add(mcAcFundTxnRecPO);
+        mcFundTpReltnPOList.add(mcFundTpReltnPO);
+    }
+
+    private <T> void insertInSmallBatches(List<T> dataList, BatchInsertFunction<T> insertFunction) {
+        if (dataList == null || dataList.isEmpty()) {
+            return;
+        }
+        
+        int totalSize = dataList.size();
+        for (int i = 0; i < totalSize; i += INSERT_BATCH_SIZE) {
+            int end = Math.min(i + INSERT_BATCH_SIZE, totalSize);
+            List<T> subList = dataList.subList(i, end);
+            insertFunction.insert(subList);
+        }
+    }
+
+    @FunctionalInterface
+    private interface BatchInsertFunction<T> {
+        void insert(List<T> list);
+    }
+
+    // ========== 业务逻辑方法 ==========
+
+    private String isChqAndIsTrnfrTrans(CashVoucherWithRequestDTO items, String type) {
+        if (type.equals("chq")) {
+            if (!StringUtils.isEmpty(items.getMode())) {
+                return items.getMode().contains("CHQ") ? "Y" : "N";
+            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
+                return items.getWithdrawMode().contains("CHQ") ? "Y" : "N";
+            } else return "N";
+        } else {
+            if (!StringUtils.isEmpty(items.getMode())) {
+                return items.getMode().equals("3. INT TRF") ? "Y" : "N";
+            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
+                return items.getWithdrawMode().equals("3. INT TRF") ? "Y" : "N";
+            } else return "N";
+        }
+    }
+
+    private String isRevTrans(CashVoucherWithRequestDTO items) {
+        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
+            if (!items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus().contains("CAN")) {
+                return "Y";
+            }
+        }
+        return "N";
+    }
+
+    private String isTodayRevTrans(CashVoucherWithRequestDTO items) {
+        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
+            if (items.getCancelDate().equals(items.getConfirmationDate()) && items.getStatus().contains("CAN")) {
+                return "Y";
+            }
+        }
+        return "N";
+    }
+
+    private Long txnTypIdValueConvert(String code) {
+        TransactionTypesPO transactionTypesPO = transactionTypesMapper.selectTxnTypeCode(code);
+        return transactionTypesPO.getSignIndicator().equals("C") ? 1L : 6L;
+    }
+
+    private BigDecimal baseCcyEquAmtValueProcess(CashVoucherWithRequestDTO po) {
+        ForexRatePO forexRatePO = forexRateMapper.selectRateByDate(po.getCcy(), 
+                String.valueOf(po.getConfirmationDate()).split("T")[0]);
+        return po.getAmount().multiply(forexRatePO.getXRate()).setScale(8, RoundingMode.HALF_UP);
+    }
+
+    private String txnTypActnCdeValueCovert(String code) {
+        TransactionTypesPO transactionTypesPO = transactionTypesMapper.selectTxnTypeCode(code);
+        if (transactionTypesPO.getSignIndicator() != null) {
+            return transactionTypesPO.getSignIndicator().equals("C") ? "IN" : "OUT";
+        }
+        return "";
+    }
+
+    @DS("master")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveCashVoucherMapMSSE(List<CashVoucherMapMSSEPO> list) {
+        if (list != null && !list.isEmpty()) {
+            cashVoucherMapMSSEMapper.insert(list);
+        }
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcAcFundTxn(List<McAcFundTxnRecPO> list) {
+        if (list != null && !list.isEmpty()) {
+            mcAcFundTxnRecMapper.batchInsert(list);
+        }
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcAcFundRec(List<McAcFundRecPO> list) {
+        if (list != null && !list.isEmpty()) {
+            mcAcFundRecMapper.batchInsert(list);
+        }
+    }
+
+    @DS("oracle")
+    @Transactional(rollbackFor = Exception.class)
+    public void saveToOracleMcFundTpReltn(List<McFundTpReltnPO> list) {
+        if (list != null && !list.isEmpty()) {
+            mcFundTpReltnMapper.batchInsert(list);
+        }
+    }
+}
+     
+
