@@ -1,64 +1,3 @@
-    int deleteByIds(@Param("ids") List<Long> ids);
-
-    <delete id="deleteByIds">
-        DELETE FROM MSSAPP.MC_AC_FUND_TXN_REC
-        WHERE AC_FUND_TXN_RID IN
-        <foreach collection="ids" item="id" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </delete>
-
-    <delete id="deleteByIds">
-        DELETE FROM MSSAPP.MC_AC_FUND_REC
-        WHERE AC_FUND_RID IN
-        <foreach collection="ids" item="id" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </delete>
-
-    <delete id="deleteByIds">
-        DELETE FROM MSSAPP.MC_FUND_TP_RELTN
-        WHERE FUND_TP_RELTN_CDE IN
-        <foreach collection="ids" item="id" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </delete>
-
-
-    int batchInsert(@Param("list") List<CashVoucherMapMSSEPO> list);
-
-    int deleteByAcFundRids(@Param("ids") List<Long> ids);
-
-    <!-- SQL Server batch insert -->
-    <insert id="batchInsert" parameterType="java.util.List">
-        INSERT INTO dbo.CashVoucherMapMSSE (VoucherNo, Market, AC_FUND_RID)
-        VALUES
-        <foreach collection="list" item="item" separator=",">
-            (#{item.voucherNo}, #{item.market}, #{item.acFundRid})
-        </foreach>
-    </insert>
-
-    <delete id="deleteByAcFundRids">
-        DELETE FROM dbo.CashVoucherMapMSSE
-        WHERE AC_FUND_RID IN
-        <foreach collection="ids" item="id" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </delete>
-
-
-    /** 全量迁移 */
-    String writeProcessedData();
-
-    /**
-     * 限制最多迁移 maxRows 条，用于测试
-     * @param maxRows 最多迁移的总行数，传 0 或负数表示全量
-     */
-    String writeProcessedData(int maxRows);
-
-
-
-
 package org.example.service.impl;
 
 import com.baomidou.dynamic.datasource.annotation.DS;
@@ -343,15 +282,35 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
     /**
      * Oracle 三张表同一事务写入。
      * 三张表在同一个 @Transactional 中提交，任意一张失败则全部回滚，保证 Oracle 侧原子性。
+     * 注意：Oracle INSERT ALL 绑定变量上限 32767，MC_AC_FUND_REC 有 139 个字段，
+     *       所以每次最多插入 32767/139 ≈ 235 条，这里取 200 作为安全值。
+     *       MC_AC_FUND_TXN_REC 和 MC_FUND_TP_RELTN 字段少，子批次可大一些，取 500。
      */
+    // MC_AC_FUND_REC 每次 INSERT ALL 最多处理的行数（139字段，32767/139≈235，取200保险）
+    private static final int ORACLE_REC_SUB_BATCH = 200;
+    // MC_AC_FUND_TXN_REC / MC_FUND_TP_RELTN 每次 INSERT ALL 最多处理的行数（9字段，取500）
+    private static final int ORACLE_SMALL_SUB_BATCH = 500;
+
     @DS("oracle")
     @Transactional(rollbackFor = Exception.class)
     public void saveAllToOracle(List<McAcFundTxnRecPO> txnList,
                                 List<McAcFundRecPO> recList,
                                 List<McFundTpReltnPO> tpReltnList) {
-        mcAcFundTxnRecMapper.batchInsert(txnList);
-        mcAcFundRecMapper.batchInsert(recList);
-        mcFundTpReltnMapper.batchInsert(tpReltnList);
+        // MC_AC_FUND_TXN_REC 分子批插入
+        for (int i = 0; i < txnList.size(); i += ORACLE_SMALL_SUB_BATCH) {
+            mcAcFundTxnRecMapper.batchInsert(
+                    txnList.subList(i, Math.min(i + ORACLE_SMALL_SUB_BATCH, txnList.size())));
+        }
+        // MC_AC_FUND_REC 字段最多，子批最小
+        for (int i = 0; i < recList.size(); i += ORACLE_REC_SUB_BATCH) {
+            mcAcFundRecMapper.batchInsert(
+                    recList.subList(i, Math.min(i + ORACLE_REC_SUB_BATCH, recList.size())));
+        }
+        // MC_FUND_TP_RELTN 分子批插入
+        for (int i = 0; i < tpReltnList.size(); i += ORACLE_SMALL_SUB_BATCH) {
+            mcFundTpReltnMapper.batchInsert(
+                    tpReltnList.subList(i, Math.min(i + ORACLE_SMALL_SUB_BATCH, tpReltnList.size())));
+        }
     }
 
     /**
