@@ -356,44 +356,60 @@ public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseS
                                  List<McAcFundRecPO> mcAcFundRecPOList,
                                  List<McFundTpReltnPO> mcFundTpReltnPOList) {
         
-        // 第1步：插入CashVoucherMapMSSE
+        // 第 1 步：插入 CashVoucherMapMSSE
         try {
-            log.debug("开始插入CashVoucherMapMSSE，数据量: {}", cashVoucherMapMSSEPOList.size());
+            log.debug("开始插入 CashVoucherMapMSSE，数据量：{}", cashVoucherMapMSSEPOList.size());
             insertInSmallBatches(cashVoucherMapMSSEPOList, this::saveCashVoucherMapMSSE);
-            log.debug("CashVoucherMapMSSE插入完成");
+            log.debug("CashVoucherMapMSSE 插入完成");
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("CashVoucherMapMSSE 插入过程中被中断", e);
         } catch (Exception e) {
-            log.error("CashVoucherMapMSSE插入失败，数据量: {}", cashVoucherMapMSSEPOList.size(), e);
-            throw new RuntimeException("CashVoucherMapMSSE插入失败", e);
+            log.error("CashVoucherMapMSSE 插入失败，数据量：{}", cashVoucherMapMSSEPOList.size(), e);
+            throw new RuntimeException("CashVoucherMapMSSE 插入失败", e);
         }
         
-        // 第2步：插入McAcFundTxnRec
+        // 第 2 步：插入 McAcFundTxnRec
         try {
-            log.debug("开始插入McAcFundTxnRec，数据量: {}", mcAcFundTxnRecPOList.size());
+            log.debug("开始插入 McAcFundTxnRec，数据量：{}", mcAcFundTxnRecPOList.size());
             insertInSmallBatches(mcAcFundTxnRecPOList, this::saveToOracleMcAcFundTxn);
-            log.debug("McAcFundTxnRec插入完成");
+            log.debug("McAcFundTxnRec 插入完成");
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("McAcFundTxnRec 插入过程中被中断", e);
         } catch (Exception e) {
-            log.error("McAcFundTxnRec插入失败，数据量: {}", mcAcFundTxnRecPOList.size(), e);
-            throw new RuntimeException("McAcFundTxnRec插入失败", e);
+            log.error("McAcFundTxnRec 插入失败，数据量：{}", mcAcFundTxnRecPOList.size(), e);
+            throw new RuntimeException("McAcFundTxnRec 插入失败", e);
         }
         
-        // 第3步：插入McAcFundRec
+        // 第 3 步：插入 McAcFundRec
         try {
-            log.debug("开始插入McAcFundRec，数据量: {}", mcAcFundRecPOList.size());
+            log.debug("开始插入 McAcFundRec，数据量：{}", mcAcFundRecPOList.size());
             insertInSmallBatches(mcAcFundRecPOList, this::saveToOracleMcAcFundRec);
-            log.debug("McAcFundRec插入完成");
+            log.debug("McAcFundRec 插入完成");
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("McAcFundRec 插入过程中被中断", e);
         } catch (Exception e) {
-            log.error("McAcFundRec插入失败，数据量: {}", mcAcFundRecPOList.size(), e);
-            throw new RuntimeException("McAcFundRec插入失败", e);
+            log.error("McAcFundRec 插入失败，数据量：{}", mcAcFundRecPOList.size(), e);
+            throw new RuntimeException("McAcFundRec 插入失败", e);
         }
         
-        // 第4步：插入McFundTpReltn
+        // 第 4 步：插入 McFundTpReltn
         try {
-            log.debug("开始插入McFundTpReltn，数据量: {}", mcFundTpReltnPOList.size());
+            log.debug("开始插入 McFundTpReltn，数据量：{}", mcFundTpReltnPOList.size());
             insertInSmallBatches(mcFundTpReltnPOList, this::saveToOracleMcFundTpReltn);
-            log.debug("McFundTpReltn插入完成");
+            log.debug("McFundTpReltn 插入完成");
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("McFundTpReltn 插入过程中被中断", e);
         } catch (Exception e) {
-            log.error("McFundTpReltn插入失败，数据量: {}", mcFundTpReltnPOList.size(), e);
-            throw new RuntimeException("McFundTpReltn插入失败", e);
+            log.error("McFundTpReltn 插入失败，数据量：{}", mcFundTpReltnPOList.size(), e);
+            throw new RuntimeException("McFundTpReltn 插入失败", e);
         }
     }
 
@@ -513,3 +529,4 @@ public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseS
         }
     }
 }
+
