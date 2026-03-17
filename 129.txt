@@ -1,17 +1,3 @@
-<mapper namespace="org.example.mapper.CashVoucherMapMSSEMapper">
-
-    <insert id="batchInsert" parameterType="java.util.List">
-        INSERT INTO cash_voucher_map_msse (voucher_no, market, ac_fund_rid)
-        VALUES
-        <foreach collection="list" item="item" separator=",">
-            (#{item.voucherNo,jdbcType=VARCHAR}, #{item.market,jdbcType=VARCHAR}, #{item.acFundRid,jdbcType=BIGINT})
-        </foreach>
-    </insert>
-
-</mapper>
-
-int batchInsert(@Param("list") List<CashVoucherMapMSSEPO> list);
-
 package org.example.service.impl;
 
 import com.baomidou.dynamic.datasource.annotation.DS;
@@ -72,6 +58,9 @@ public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseS
     
     // 每次批量插入的数据量（Oracle INSERT ALL语法限制，建议200-500）
     private static final int INSERT_BATCH_SIZE = 200;
+    
+    // 测试模式下最大处理数据量（0表示不限制，处理全部数据）
+    private static final int TEST_MAX_COUNT = 100000; // 设置为0表示不限制
 
     @Override
     public String writeProcessedData() {
@@ -81,14 +70,22 @@ public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseS
         try {
             // 1. 获取总数据量
             int totalCount = getTotalCount();
-            log.info("总数据量: {} 条", totalCount);
+            log.info("总数据量：{} 条", totalCount);
             
             if (totalCount == 0) {
                 return "没有需要迁移的数据";
             }
             
-            // 2. 计算需要的批次数
-            int totalBatches = (int) Math.ceil((double) totalCount / BATCH_SIZE);
+            // 2. 根据测试模式调整实际处理的数据量
+            int actualTotalCount = TEST_MAX_COUNT > 0 ? Math.min(totalCount, TEST_MAX_COUNT) : totalCount;
+            if (TEST_MAX_COUNT > 0 && actualTotalCount < totalCount) {
+                log.info("测试模式：只处理前 {} 条数据（总共 {} 条）", actualTotalCount, totalCount);
+            } else {
+                log.info("全量模式：处理全部 {} 条数据", actualTotalCount);
+            }
+            
+            // 3. 计算需要的批次数
+            int totalBatches = (int) Math.ceil((double) actualTotalCount / BATCH_SIZE);
             log.info("分批处理，每批 {} 条，共 {} 批", BATCH_SIZE, totalBatches);
             
             // 3. 统计计数器
@@ -104,17 +101,28 @@ public class CashVoucherToMsseServiceImplOptimized implements CashVoucherToMsseS
                 final int batchIndex = i;
                 final int offset = i * BATCH_SIZE;
                 
+                // 如果已处理数量达到限制，停止提交新任务
+                if (offset >= actualTotalCount) {
+                    // 对于超出范围的批次，直接减少计数器
+                    latch.countDown();
+                    continue;
+                }
+                
                 migrationExecutor.execute(() -> {
                     try {
+                        // 计算当前批次实际处理的数据量（避免超过限制）
+                        int remaining = actualTotalCount - offset;
+                        int currentBatchSize = Math.min(BATCH_SIZE, remaining);
+                        
                         // 处理单个批次
-                        int processed = processBatch(offset, BATCH_SIZE, batchIndex + 1, totalBatches);
+                        int processed = processBatch(offset, currentBatchSize, batchIndex + 1, totalBatches);
                         successCount.addAndGet(processed);
                         processedCount.addAndGet(processed);
                         
                         // 每10批输出一次进度
                         if ((batchIndex + 1) % 10 == 0) {
-                            double progress = (double) processedCount.get() / totalCount * 100;
-                            log.info("迁移进度: {}/{} ({:.2f}%)", processedCount.get(), totalCount, progress);
+                            double progress = (double) processedCount.get() / actualTotalCount * 100;
+                            log.info("迁移进度: {}/{} ({:.2f}%)", processedCount.get(), actualTotalCount, progress);
                         }
                     } catch (Exception e) {
                         failCount.incrementAndGet();
