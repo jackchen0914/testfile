@@ -1,4 +1,11 @@
-            // Oracle IN 子句限制 1000 个值，分批删除
+            String relationshipCode = (Objects.equals(item.getRelationship(), "") || item.getRelationship() == null) 
+                    ? String.valueOf(System.nanoTime() % 1000000) 
+                    : item.getRelationship();
+            mcFundTpReltnPO.setFundTpReltnCde(relationshipCode);
+            mcFundTpReltnPO.setFundTpReltnDscr(relationshipCode);
+            mcFundTpReltnPO.setFundTpReltnPri((long) (18 + System.nanoTime() % 1000));
+
+// Oracle IN 子句限制 1000 个值，分批删除
             batchDeleteLong(txnRidList, ids -> mcAcFundTxnRecMapper.deleteByIds(ids));
             batchDeleteLong(fundRidList, ids -> mcAcFundRecMapper.deleteByIds(ids));
             batchDeleteString(tpReltnCdeList, ids -> mcFundTpReltnMapper.deleteByIds(ids));
