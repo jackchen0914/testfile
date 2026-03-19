@@ -1,214 +1,43 @@
    /**
-    * 查询 CashVoucher 表中最早的 VoucherDate（升序第一条）
+    * 查询指定年份区间内的记录总数，用于计算总批数
     */
-   LocalDateTime selectMinVoucherDate();
-
-   /**
-    * 查询 CashVoucher 表中最晚的 VoucherDate（降序第一条）
-    */
-   LocalDateTime selectMaxVoucherDate();
-
-   /**
-    * 按年份区间分页查询，用于多线程按年处理
-    *
-    * @param startTime 年初时间
-    * @param endTime   年末时间
-    * @param offset    分页偏移
-    * @param limit     每页大小
-    */
-   List<CashVoucherWithRequestDTO> selectCashVoucherByYearPage(
+   long countCashVoucherByYear(
            @Param("startTime") LocalDateTime startTime,
-           @Param("endTime") LocalDateTime endTime,
-           @Param("offset") int offset,
-           @Param("limit") int limit
+           @Param("endTime") LocalDateTime endTime
    );
 
-
-    <!-- 查询最早的 VoucherDate -->
-    <select id="selectMinVoucherDate" resultType="java.time.LocalDateTime">
-        SELECT TOP 1 VoucherDate
-        FROM CashVoucher
-        WHERE VoucherDate IS NOT NULL
-        ORDER BY VoucherDate ASC
-    </select>
-
-    <!-- 查询最晚的 VoucherDate -->
-    <select id="selectMaxVoucherDate" resultType="java.time.LocalDateTime">
-        SELECT TOP 1 VoucherDate
-        FROM CashVoucher
-        WHERE VoucherDate IS NOT NULL
-        ORDER BY VoucherDate DESC
-    </select>
-
-    <!-- 按年份区间分页查询，用于多线程按年处理 -->
-    <select id="selectCashVoucherByYearPage" resultMap="CashVoucherWithRequestMap">
-        select
-        t1.InputDate,
-        t1.Clnt,
-        t1.CCY,
-        t1.TxnType,
-        t1.VoucherNo,
-        t1.Amount,
-        t1.ValueDate,
-        t1.StatusFlag,
-        t1.ManualInput,
-        t1.VoucherDate,
-        t1.Userid,
-        t1.Remark,
-        t1.[Source],
-        t1.AccountName,
-        t1.AccountNumber,
-        t1.Status,
-        t1.Charge,
-        t1.CancelDate,
-        t1.ConfirmationDate,
-        t1.ApprovalTime,
-        t1.Market,
-        t2.Relationship,
-        t2.Mode,
-        t2.WithdrawMode,
-        t2.BenfName
-        from
-        CashVoucher t1
-        left join CashVoucherRequest t2 on
-        t1.VoucherNo = t2.VoucherNo
-        and t1.Market = t2.Market
-        where
-        t1.VoucherDate IS NOT NULL
-        AND t1.VoucherDate &gt;= #{startTime}
-        AND t1.VoucherDate &lt; #{endTime}
-        order by
-        t1.VoucherDate ASC, t1.VoucherNo, t1.Market
-        OFFSET #{offset} ROWS FETCH NEXT #{limit} ROWS ONLY
-    </select>
-
-
-
-package org.example.mapper;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import org.apache.ibatis.annotations.Mapper;
-import org.apache.ibatis.annotations.Param;
-import org.apache.ibatis.annotations.Select;
-import org.example.pojo.ForexRatePO;
-
-import java.util.List;
-
-/**
- * <p>
- *  Mapper 接口
- * </p>
- *
- * @author JackChen
- * @since 2025-12-16
- */
-@Mapper
-@DS("master")
-public interface ForexRateMapper extends BaseMapper<ForexRatePO> {
-
-    @Select("select xrate from dbo.ForexRate fr where ccy = #{currency} and date = #{date};")
-    ForexRatePO selectRateByDate(@Param("currency") String currency, @Param("date") String date);
+    /**
+     * 全量迁移
+     */
+    String writeProcessedData();
 
     /**
-     * 批量查询指定年份区间内的所有汇率记录，用于预加载到 Map，避免 N+1 查询
-     * key 格式：ccy + "_" + date（yyyy-MM-dd），由 Service 层拼接
+     * 限制最大迁移条数（用于测试，0 或负数表示不限制）
+     *
+     * @param maxRows 最大迁移行数，例如 1_000_000 表示只跑 100 万
      */
-    @Select("select CCY, Date, XRate from dbo.ForexRate where Date >= #{startDate} and Date < #{endDate}")
-    List<ForexRatePO> selectRatesByDateRange(@Param("startDate") String startDate, @Param("endDate") String endDate);
-}
+    String writeProcessedData(long maxRows);
 
 
-package org.example.mapper;
-
-import com.baomidou.dynamic.datasource.annotation.DS;
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import org.apache.ibatis.annotations.Mapper;
-import org.apache.ibatis.annotations.Param;
-import org.apache.ibatis.annotations.Select;
-import org.example.pojo.TransactionTypesPO;
-
-import java.util.List;
-
-/**
- * <p>
- *  Mapper 接口
- * </p>
- *
- * @author JackChen
- * @since 2025-12-15
- */
-@Mapper
-@DS("master")
-public interface TransactionTypesMapper extends BaseMapper<TransactionTypesPO> {
-
-    @Select("select SignIndicator from dbo.TransactionTypes where  StkMoney = 'M' and TransactionTypes = #{TransactionTypes}")
-    TransactionTypesPO selectTxnTypeCode(@Param("TransactionTypes") String transactionTypes);
-
-    @Select("select SignIndicator from dbo.TransactionTypes where  StkMoney = 'S' and TransactionTypes = #{TransactionTypes}")
-    TransactionTypesPO selectTxnTypeActionCode(@Param("TransactionTypes") String transactionTypes);
-
-    /**
-     * 一次性批量查询所有 StkMoney='M' 的记录，用于预加载到 Map，避免 N+1 查询
-     */
-    @Select("select TransactionTypes, SignIndicator from dbo.TransactionTypes where StkMoney = 'M'")
-    List<TransactionTypesPO> selectAllTxnTypeMoney();
-
-    /**
-     * 一次性批量查询所有 StkMoney='S' 的记录，用于预加载到 Map，避免 N+1 查询
-     */
-    @Select("select TransactionTypes, SignIndicator from dbo.TransactionTypes where StkMoney = 'S'")
-    List<TransactionTypesPO> selectAllTxnTypeAction();
-}
-
-
-
-package org.example.config;
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-
-/**
- * 数据迁移专用线程池配置
- * IO 密集型场景：核心线程数 = CPU核心数 * 2
- */
-@Configuration
-public class MigrationThreadPoolConfig {
-
-    /**
-     * 核心线程数：按年份分片，最大并发年数，设为 12 以覆盖各种年份跨度
-     * 最大线程数：适当放大，应对突发
-     * 队列容量：有界队列，防止无限制提交导致 OOM
-     * 拒绝策略：CallerRunsPolicy，让调用方线程兜底执行，不丢任务
-     */
-    @Bean(name = "migrationThreadPool")
-    public ThreadPoolExecutor migrationThreadPool() {
-        int corePoolSize = 12;
-        int maximumPoolSize = 20;
-        long keepAliveSeconds = 60L;
-        int queueCapacity = 50;
-
-        return new ThreadPoolExecutor(
-                corePoolSize,
-                maximumPoolSize,
-                keepAliveSeconds,
-                TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(queueCapacity),
                 r -> {
                     Thread t = new Thread(r);
-                    t.setName("migration-year-worker-" + t.getId());
+                    // 线程名由业务层在 processOneYear 中按年份动态设置
+                    // 这里给一个临时名，避免显示 Thread-N
+                    t.setName("migration-year-pending");
                     t.setDaemon(false);
                     return t;
                 },
-                new ThreadPoolExecutor.CallerRunsPolicy()
-        );
-    }
-}
 
+
+    <!-- 查询指定年份区间内的记录总数 -->
+    <select id="countCashVoucherByYear" resultType="long">
+        SELECT COUNT(1)
+        FROM CashVoucher t1
+        WHERE t1.VoucherDate IS NOT NULL
+          AND t1.VoucherDate &gt;= #{startTime}
+          AND t1.VoucherDate &lt; #{endTime}
+    </select>
 
 
 package org.example.service.impl;
@@ -289,6 +118,11 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
 
     @Override
     public String writeProcessedData() {
+        return writeProcessedData(0L);
+    }
+
+    @Override
+    public String writeProcessedData(long maxRows) {
         // ① 查询数据时间区间
         LocalDateTime minDate = cashVoucherMapper.selectMinVoucherDate();
         LocalDateTime maxDate = cashVoucherMapper.selectMaxVoucherDate();
@@ -299,10 +133,13 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
 
         int startYear = minDate.getYear();
         int endYear   = maxDate.getYear();
+        boolean limited = maxRows > 0;
+        if (limited) {
+            log.info("[测试模式] 最大迁移行数限制：{} 条", maxRows);
+        }
         log.info("迁移年份区间：{} ~ {}，共 {} 年", startYear, endYear, (endYear - startYear + 1));
 
         // ② 预加载 TransactionTypes 字典到 Map（全表数据量很小，一次加载完）
-        //    key = TransactionTypes 字段值，value = PO 对象
         Map<String, TransactionTypesPO> txnMoneyMap = transactionTypesMapper.selectAllTxnTypeMoney()
                 .stream()
                 .collect(Collectors.toMap(
@@ -318,18 +155,23 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
                         (existing, replacement) -> existing
                 ));
 
-        // ③ 为每一年创建一个 CompletableFuture 异步任务
+        // ③ 按年份分配限额（测试模式下按年份数据量比例分配）
+        //    remainingRows 用 AtomicLong 跨线程共享剩余可处理行数
+        final java.util.concurrent.atomic.AtomicLong remainingRows =
+                new java.util.concurrent.atomic.AtomicLong(limited ? maxRows : Long.MAX_VALUE);
+
+        // ④ 为每一年创建一个 CompletableFuture 异步任务
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (int year = startYear; year <= endYear; year++) {
             final int targetYear = year;
             CompletableFuture<Void> future = CompletableFuture.runAsync(
-                    () -> processOneYear(targetYear, txnMoneyMap, txnActionMap),
+                    () -> processOneYear(targetYear, txnMoneyMap, txnActionMap, remainingRows),
                     migrationThreadPool
             );
             futures.add(future);
         }
 
-        // ④ 等待所有年份任务完成
+        // ⑤ 等待所有年份任务完成
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
         } catch (InterruptedException e) {
@@ -340,7 +182,7 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
             log.error("迁移任务执行异常", e.getCause());
             return "error: " + e.getCause().getMessage();
         } finally {
-            // ⑤ 释放字典 Map 内存
+            // ⑥ 释放字典 Map 内存
             txnMoneyMap.clear();
             txnActionMap.clear();
         }
@@ -351,56 +193,95 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
 
     /**
      * 处理单个年份的数据迁移：分批分页轮询，完成一批再处理下一批
+     *
+     * @param remainingRows 跨年份共享的剩余可处理行数（测试模式限额），Long.MAX_VALUE 表示不限制
      */
     private void processOneYear(int year,
                                 Map<String, TransactionTypesPO> txnMoneyMap,
-                                Map<String, TransactionTypesPO> txnActionMap) {
-        LocalDateTime yearStart = LocalDateTime.of(year, 1, 1, 0, 0, 0);
-        LocalDateTime yearEnd   = LocalDateTime.of(year + 1, 1, 1, 0, 0, 0);
+                                Map<String, TransactionTypesPO> txnActionMap,
+                                java.util.concurrent.atomic.AtomicLong remainingRows) {
+        // 需求1：线程按年份动态命名
+        String originalThreadName = Thread.currentThread().getName();
+        Thread.currentThread().setName("migration-year-" + year);
+        try {
+            LocalDateTime yearStart = LocalDateTime.of(year, 1, 1, 0, 0, 0);
+            LocalDateTime yearEnd   = LocalDateTime.of(year + 1, 1, 1, 0, 0, 0);
 
-        // 预加载当年汇率数据到 Map，key = "CCY_yyyy-MM-dd"
-        String startDateStr = yearStart.toLocalDate().toString();
-        String endDateStr   = yearEnd.toLocalDate().toString();
-        Map<String, ForexRatePO> forexMap = forexRateMapper
-                .selectRatesByDateRange(startDateStr, endDateStr)
-                .stream()
-                .collect(Collectors.toMap(
-                        po -> buildForexKey(po.getCcy(),
-                                po.getDate() != null ? po.getDate().toLocalDate().toString() : ""),
-                        po -> po,
-                        (existing, replacement) -> existing
-                ));
+            // 需求3：先查当年总条数，计算总批数
+            long totalCount = cashVoucherMapper.countCashVoucherByYear(yearStart, yearEnd);
+            // 需求2：本年实际可处理上限 = min(totalCount, 当前全局剩余额度)
+            long yearLimit = Math.min(totalCount, remainingRows.get());
+            if (yearLimit <= 0) {
+                log.info("[{}年] 已达到最大迁移行数限制，跳过", year);
+                return;
+            }
+            long totalBatches = (long) Math.ceil((double) yearLimit / PAGE_SIZE);
+            log.info("[{}年] 总记录数：{}，本次处理上限：{}，预计共 {} 批",
+                    year, totalCount, yearLimit, totalBatches);
 
-        log.info("[{}年] 汇率预加载完成，共 {} 条", year, forexMap.size());
+            // 预加载当年汇率数据到 Map，key = "CCY_yyyy-MM-dd"
+            String startDateStr = yearStart.toLocalDate().toString();
+            String endDateStr   = yearEnd.toLocalDate().toString();
+            Map<String, ForexRatePO> forexMap = forexRateMapper
+                    .selectRatesByDateRange(startDateStr, endDateStr)
+                    .stream()
+                    .collect(Collectors.toMap(
+                            po -> buildForexKey(po.getCcy(),
+                                    po.getDate() != null ? po.getDate().toLocalDate().toString() : ""),
+                            po -> po,
+                            (existing, replacement) -> existing
+                    ));
+            log.info("[{}年] 汇率预加载完成，共 {} 条", year, forexMap.size());
 
-        int offset = 0;
-        int batchIndex = 0;
-        while (true) {
-            List<CashVoucherWithRequestDTO> batch =
-                    cashVoucherMapper.selectCashVoucherByYearPage(yearStart, yearEnd, offset, PAGE_SIZE);
-            if (batch == null || batch.isEmpty()) {
-                break;
+            int offset = 0;
+            int batchIndex = 0;
+            long processedInYear = 0;
+
+            while (true) {
+                // 需求2：计算本批实际可取条数（受限额约束）
+                long leftInYear = yearLimit - processedInYear;
+                if (leftInYear <= 0) {
+                    log.info("[{}年] 已达本年处理上限 {} 条，停止", year, yearLimit);
+                    break;
+                }
+                int fetchSize = (int) Math.min(PAGE_SIZE, leftInYear);
+
+                List<CashVoucherWithRequestDTO> batch =
+                        cashVoucherMapper.selectCashVoucherByYearPage(yearStart, yearEnd, offset, fetchSize);
+                if (batch == null || batch.isEmpty()) {
+                    break;
+                }
+
+                batchIndex++;
+                int fetchedSize = batch.size();
+                // 需求3：日志显示"第X批/共Y批"
+                log.info("[{}年] 第 {}/{} 批，本批 {} 条，开始处理",
+                        year, batchIndex, totalBatches, fetchedSize);
+
+                processBatch(batch, txnMoneyMap, txnActionMap, forexMap, batchIndex);
+
+                processedInYear += fetchedSize;
+                // 需求2：扣减全局剩余额度
+                remainingRows.addAndGet(-fetchedSize);
+
+                // 处理完后立即清空引用，辅助 GC
+                batch.clear();
+
+                // 本批实际获取条数小于 fetchSize，说明已是最后一批
+                if (fetchedSize < fetchSize) {
+                    break;
+                }
+                offset += fetchSize;
             }
 
-            batchIndex++;
-            int fetchedSize = batch.size();
-            log.info("[{}年] 第 {} 批，共 {} 条，开始处理", year, batchIndex, fetchedSize);
+            // 释放当年汇率 Map 内存
+            forexMap.clear();
+            log.info("[{}年] 迁移完成，本年共处理 {} 条", year, processedInYear);
 
-            processBatch(batch, txnMoneyMap, txnActionMap, forexMap, batchIndex);
-
-            // 处理完后立即清空引用，辅助 GC
-            batch.clear();
-
-            // 本批实际获取条数小于 PAGE_SIZE，说明已是最后一批
-            if (fetchedSize < PAGE_SIZE) {
-                break;
-            }
-            offset += PAGE_SIZE;
+        } finally {
+            // 恢复线程名
+            Thread.currentThread().setName(originalThreadName);
         }
-
-        // 释放当年汇率 Map 内存
-        forexMap.clear();
-        log.info("[{}年] 迁移完成", year);
     }
 
     /**
