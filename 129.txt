@@ -1,81 +1,3 @@
-
-   /**
-    * 游标翻页查询（Keyset Pagination），性能远优于 OFFSET 翻页。
-    * 首批传入 cursorDate=startTime、cursorVoucherNo=0、cursorMarket="" 即可。
-    * 后续批次传入上一批最后一条记录的 (VoucherDate, VoucherNo, Market)。
-    *
-    * @param startTime     年初时间（区间左边界）
-    * @param endTime       年末时间（区间右边界，不含）
-    * @param cursorDate    游标：上一批最后一条的 VoucherDate（首批传 startTime）
-    * @param cursorVoucherNo 游标：上一批最后一条的 VoucherNo（首批传 0）
-    * @param cursorMarket  游标：上一批最后一条的 Market（首批传 ""）
-    * @param limit         每批大小
-    */
-   List<CashVoucherWithRequestDTO> selectCashVoucherByYearKeyset(
-           @Param("startTime")       LocalDateTime startTime,
-           @Param("endTime")         LocalDateTime endTime,
-           @Param("cursorDate")      LocalDateTime cursorDate,
-           @Param("cursorVoucherNo") int cursorVoucherNo,
-           @Param("cursorMarket")    String cursorMarket,
-           @Param("limit")           int limit
-   );
-
-    <!--
-        游标翻页（Keyset Pagination）：彻底消除 OFFSET 越翻越慢的问题。
-        排序键：(VoucherDate ASC, VoucherNo ASC, Market ASC)
-        首批条件：VoucherDate &gt;= startTime
-        后续批条件：
-          (VoucherDate  &gt; cursorDate)
-          OR (VoucherDate = cursorDate AND VoucherNo  &gt; cursorVoucherNo)
-          OR (VoucherDate = cursorDate AND VoucherNo  = cursorVoucherNo AND Market &gt; cursorMarket)
-        同时限制 VoucherDate &lt; endTime 保证不越界。
-    -->
-    <select id="selectCashVoucherByYearKeyset" resultMap="CashVoucherWithRequestMap">
-        SELECT TOP (#{limit})
-        t1.InputDate,
-        t1.Clnt,
-        t1.CCY,
-        t1.TxnType,
-        t1.VoucherNo,
-        t1.Amount,
-        t1.ValueDate,
-        t1.StatusFlag,
-        t1.ManualInput,
-        t1.VoucherDate,
-        t1.Userid,
-        t1.Remark,
-        t1.[Source],
-        t1.AccountName,
-        t1.AccountNumber,
-        t1.Status,
-        t1.Charge,
-        t1.CancelDate,
-        t1.ConfirmationDate,
-        t1.ApprovalTime,
-        t1.Market,
-        t2.Relationship,
-        t2.Mode,
-        t2.WithdrawMode,
-        t2.BenfName
-        FROM CashVoucher t1
-        LEFT JOIN CashVoucherRequest t2
-            ON t1.VoucherNo = t2.VoucherNo
-           AND t1.Market    = t2.Market
-        WHERE t1.VoucherDate IS NOT NULL
-          AND t1.VoucherDate &lt; #{endTime}
-          AND (
-              t1.VoucherDate &gt; #{cursorDate}
-              OR (t1.VoucherDate = #{cursorDate} AND t1.VoucherNo &gt; #{cursorVoucherNo})
-              OR (t1.VoucherDate = #{cursorDate} AND t1.VoucherNo = #{cursorVoucherNo} AND t1.Market &gt; #{cursorMarket})
-          )
-        ORDER BY t1.VoucherDate ASC, t1.VoucherNo ASC, t1.Market ASC
-    </select>
-
-
-
-
-
-
 package org.example.service.impl;
 
 import com.baomidou.dynamic.datasource.annotation.DS;
@@ -288,11 +210,34 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
                 int fetchSize = (int) Math.min(PAGE_SIZE, leftInYear);
 
                 // 游标翻页：不使用 OFFSET，每批从上一批最后一条之后开始
-                List<CashVoucherWithRequestDTO> batch =
-                        cashVoucherMapper.selectCashVoucherByYearKeyset(
+                // 重试机制：遇到网络抖动/超时最多重试3次，每次等待10秒后重试
+                List<CashVoucherWithRequestDTO> batch = null;
+                int maxRetry = 3;
+                for (int retry = 0; retry <= maxRetry; retry++) {
+                    try {
+                        batch = cashVoucherMapper.selectCashVoucherByYearKeyset(
                                 yearStart, yearEnd,
                                 cursorDate, cursorVoucherNo, cursorMarket,
                                 fetchSize);
+                        break; // 查询成功，退出重试循环
+                    } catch (Exception e) {
+                        if (retry < maxRetry) {
+                            log.warn("[{}年] 第 {} 批查询失败（第{}/{}次重试），{}秒后重试。原因：{}",
+                                    year, batchIndex + 1, retry + 1, maxRetry,
+                                    10 * (retry + 1), e.getMessage());
+                            try {
+                                Thread.sleep(10_000L * (retry + 1)); // 递增等待：10s, 20s, 30s
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                throw new RuntimeException("[" + year + "年] 重试等待被中断", ie);
+                            }
+                        } else {
+                            log.error("[{}年] 第 {} 批查询已重试 {} 次，仍然失败，放弃该批次",
+                                    year, batchIndex + 1, maxRetry, e);
+                            throw e; // 超过最大重试次数，向上抛出
+                        }
+                    }
+                }
                 if (batch == null || batch.isEmpty()) {
                     break;
                 }
@@ -574,5 +519,3 @@ public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
     }
 }
             
-
-
