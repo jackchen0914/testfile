@@ -1,521 +1,544 @@
-package org.example.service.impl;
+Connected to the target VM, address: '127.0.0.1:50197', transport: 'socket'
 
-import com.baomidou.dynamic.datasource.annotation.DS;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
-import org.example.mapper.*;
-import org.example.pojo.*;
-import org.example.pojo.dtos.CashVoucherWithRequestDTO;
-import org.example.service.CashVoucherToMsseService;
-import org.example.service.IdGeneratorService;
-import org.example.utils.PropertyConverUtils;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+ :: Spring Boot ::               (v2.7.18)
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.time.LocalDateTime;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.stream.Collectors;
-
-/**
- * <p>
- * CashVoucher 迁移至 MSSE 服务实现
- * 优化点：
- *   1. 按 VoucherDate 年份区间多线程并行处理（每年一个线程）
- *   2. 每年内部分批分页轮询，避免一次性加载全量数据导致 OOM
- *   3. 预加载 ForexRate / TransactionTypes 到 Map，解决 N+1 查询问题
- *   4. 每批处理完成后及时清空集合引用，辅助 GC 回收内存
- * </p>
- *
- * @author JackChen
- * @since 2025-12-12
- */
-@Service
-@Slf4j
-public class CashVoucherToMsseServiceImpl implements CashVoucherToMsseService {
-
-    private final McAcFundRecMapper mcAcFundRecMapper;
-    private final McAcFundTxnRecMapper mcAcFundTxnRecMapper;
-    private final McFundTpReltnMapper mcFundTpReltnMapper;
-
-    private final CashVoucherMapper cashVoucherMapper;
-    private final ForexRateMapper forexRateMapper;
-    private final TransactionTypesMapper transactionTypesMapper;
-    private final CashVoucherMapMSSEMapper cashVoucherMapMSSEMapper;
-
-    private final IdGeneratorService idGeneratorService;
-
-    /** 每批分页查询的大小 */
-    private static final int PAGE_SIZE = 500;
-
-    private final ThreadPoolExecutor migrationThreadPool;
-
-    public CashVoucherToMsseServiceImpl(
-            McAcFundRecMapper mcAcFundRecMapper,
-            McAcFundTxnRecMapper mcAcFundTxnRecMapper,
-            McFundTpReltnMapper mcFundTpReltnMapper,
-            CashVoucherMapper cashVoucherMapper,
-            ForexRateMapper forexRateMapper,
-            TransactionTypesMapper transactionTypesMapper,
-            CashVoucherMapMSSEMapper cashVoucherMapMSSEMapper,
-            IdGeneratorService idGeneratorService,
-            @Qualifier("migrationThreadPool") ThreadPoolExecutor migrationThreadPool) {
-        this.mcAcFundRecMapper = mcAcFundRecMapper;
-        this.mcAcFundTxnRecMapper = mcAcFundTxnRecMapper;
-        this.mcFundTpReltnMapper = mcFundTpReltnMapper;
-        this.cashVoucherMapper = cashVoucherMapper;
-        this.forexRateMapper = forexRateMapper;
-        this.transactionTypesMapper = transactionTypesMapper;
-        this.cashVoucherMapMSSEMapper = cashVoucherMapMSSEMapper;
-        this.idGeneratorService = idGeneratorService;
-        this.migrationThreadPool = migrationThreadPool;
-    }
-
-    @Override
-    public String writeProcessedData() {
-        return writeProcessedData(0L);
-    }
-
-    @Override
-    public String writeProcessedData(long maxRows) {
-        // ① 查询数据时间区间
-        LocalDateTime minDate = cashVoucherMapper.selectMinVoucherDate();
-        LocalDateTime maxDate = cashVoucherMapper.selectMaxVoucherDate();
-        if (minDate == null || maxDate == null) {
-            log.warn("CashVoucher 表中无有效 VoucherDate 数据，跳过迁移");
-            return "no data";
-        }
-
-        int startYear = minDate.getYear();
-        int endYear   = maxDate.getYear();
-        boolean limited = maxRows > 0;
-        if (limited) {
-            log.info("[测试模式] 最大迁移行数限制：{} 条", maxRows);
-        }
-        log.info("迁移年份区间：{} ~ {}，共 {} 年", startYear, endYear, (endYear - startYear + 1));
-
-        // ② 预加载 TransactionTypes 字典到 Map（全表数据量很小，一次加载完）
-        Map<String, TransactionTypesPO> txnMoneyMap = transactionTypesMapper.selectAllTxnTypeMoney()
-                .stream()
-                .collect(Collectors.toMap(
-                        TransactionTypesPO::getTransactionTypes,
-                        po -> po,
-                        (existing, replacement) -> existing
-                ));
-        Map<String, TransactionTypesPO> txnActionMap = transactionTypesMapper.selectAllTxnTypeAction()
-                .stream()
-                .collect(Collectors.toMap(
-                        TransactionTypesPO::getTransactionTypes,
-                        po -> po,
-                        (existing, replacement) -> existing
-                ));
-
-        // ③ 按年份分配限额（测试模式下按年份数据量比例分配）
-        //    remainingRows 用 AtomicLong 跨线程共享剩余可处理行数
-        final java.util.concurrent.atomic.AtomicLong remainingRows =
-                new java.util.concurrent.atomic.AtomicLong(limited ? maxRows : Long.MAX_VALUE);
-
-        // ④ 为每一年创建一个 CompletableFuture 异步任务
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (int year = startYear; year <= endYear; year++) {
-            final int targetYear = year;
-            CompletableFuture<Void> future = CompletableFuture.runAsync(
-                    () -> processOneYear(targetYear, txnMoneyMap, txnActionMap, remainingRows),
-                    migrationThreadPool
-            );
-            futures.add(future);
-        }
-
-        // ⑤ 等待所有年份任务完成
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.error("迁移任务被中断", e);
-            return "interrupted";
-        } catch (ExecutionException e) {
-            log.error("迁移任务执行异常", e.getCause());
-            return "error: " + e.getCause().getMessage();
-        } finally {
-            // ⑥ 释放字典 Map 内存
-            txnMoneyMap.clear();
-            txnActionMap.clear();
-        }
-
-        log.info("全部年份迁移完成，区间：{} ~ {}", startYear, endYear);
-        return "ok";
-    }
-
-    /**
-     * 处理单个年份的数据迁移：分批分页轮询，完成一批再处理下一批
-     *
-     * @param remainingRows 跨年份共享的剩余可处理行数（测试模式限额），Long.MAX_VALUE 表示不限制
-     */
-    private void processOneYear(int year,
-                                Map<String, TransactionTypesPO> txnMoneyMap,
-                                Map<String, TransactionTypesPO> txnActionMap,
-                                java.util.concurrent.atomic.AtomicLong remainingRows) {
-        // 需求1：线程按年份动态命名
-        String originalThreadName = Thread.currentThread().getName();
-        Thread.currentThread().setName("migration-year-" + year);
-        try {
-            LocalDateTime yearStart = LocalDateTime.of(year, 1, 1, 0, 0, 0);
-            LocalDateTime yearEnd   = LocalDateTime.of(year + 1, 1, 1, 0, 0, 0);
-
-            // 需求3：先查当年总条数，计算总批数
-            long totalCount = cashVoucherMapper.countCashVoucherByYear(yearStart, yearEnd);
-            // 需求2：本年实际可处理上限 = min(totalCount, 当前全局剩余额度)
-            long yearLimit = Math.min(totalCount, remainingRows.get());
-            if (yearLimit <= 0) {
-                log.info("[{}年] 已达到最大迁移行数限制，跳过", year);
-                return;
-            }
-            long totalBatches = (long) Math.ceil((double) yearLimit / PAGE_SIZE);
-            log.info("[{}年] 总记录数：{}，本次处理上限：{}，预计共 {} 批",
-                    year, totalCount, yearLimit, totalBatches);
-
-            // 预加载当年汇率数据到 Map，key = "CCY_yyyy-MM-dd"
-            String startDateStr = yearStart.toLocalDate().toString();
-            String endDateStr   = yearEnd.toLocalDate().toString();
-            Map<String, ForexRatePO> forexMap = forexRateMapper
-                    .selectRatesByDateRange(startDateStr, endDateStr)
-                    .stream()
-                    .collect(Collectors.toMap(
-                            po -> buildForexKey(po.getCcy(),
-                                    po.getDate() != null ? po.getDate().toLocalDate().toString() : ""),
-                            po -> po,
-                            (existing, replacement) -> existing
-                    ));
-            log.info("[{}年] 汇率预加载完成，共 {} 条", year, forexMap.size());
-
-            int offset = 0;
-            int batchIndex = 0;
-            long processedInYear = 0;
-
-            // 游标初始值：首批从年初开始，VoucherNo=0, Market=""
-            LocalDateTime cursorDate      = yearStart;
-            int           cursorVoucherNo = 0;
-            String        cursorMarket    = "";
-
-            while (true) {
-                // 需求2：计算本批实际可取条数（受限额约束）
-                long leftInYear = yearLimit - processedInYear;
-                if (leftInYear <= 0) {
-                    log.info("[{}年] 已达本年处理上限 {} 条，停止", year, yearLimit);
-                    break;
-                }
-                int fetchSize = (int) Math.min(PAGE_SIZE, leftInYear);
-
-                // 游标翻页：不使用 OFFSET，每批从上一批最后一条之后开始
-                // 重试机制：遇到网络抖动/超时最多重试3次，每次等待10秒后重试
-                List<CashVoucherWithRequestDTO> batch = null;
-                int maxRetry = 3;
-                for (int retry = 0; retry <= maxRetry; retry++) {
-                    try {
-                        batch = cashVoucherMapper.selectCashVoucherByYearKeyset(
-                                yearStart, yearEnd,
-                                cursorDate, cursorVoucherNo, cursorMarket,
-                                fetchSize);
-                        break; // 查询成功，退出重试循环
-                    } catch (Exception e) {
-                        if (retry < maxRetry) {
-                            log.warn("[{}年] 第 {} 批查询失败（第{}/{}次重试），{}秒后重试。原因：{}",
-                                    year, batchIndex + 1, retry + 1, maxRetry,
-                                    10 * (retry + 1), e.getMessage());
-                            try {
-                                Thread.sleep(10_000L * (retry + 1)); // 递增等待：10s, 20s, 30s
-                            } catch (InterruptedException ie) {
-                                Thread.currentThread().interrupt();
-                                throw new RuntimeException("[" + year + "年] 重试等待被中断", ie);
-                            }
-                        } else {
-                            log.error("[{}年] 第 {} 批查询已重试 {} 次，仍然失败，放弃该批次",
-                                    year, batchIndex + 1, maxRetry, e);
-                            throw e; // 超过最大重试次数，向上抛出
-                        }
-                    }
-                }
-                if (batch == null || batch.isEmpty()) {
-                    break;
-                }
-
-                batchIndex++;
-                int fetchedSize = batch.size();
-                // 需求3：日志显示"第X批/共Y批"
-                log.info("[{}年] 第 {}/{} 批，本批 {} 条，开始处理",
-                        year, batchIndex, totalBatches, fetchedSize);
-
-                processBatch(batch, txnMoneyMap, txnActionMap, forexMap, batchIndex);
-
-                // 更新游标为本批最后一条记录的排序键
-                CashVoucherWithRequestDTO last = batch.get(fetchedSize - 1);
-                cursorDate      = last.getVoucherDate();
-                cursorVoucherNo = last.getVoucherNo() != null ? last.getVoucherNo() : 0;
-                cursorMarket    = last.getMarket()    != null ? last.getMarket()    : "";
-
-                processedInYear += fetchedSize;
-                // 需求2：扣减全局剩余额度
-                remainingRows.addAndGet(-fetchedSize);
-
-                // 处理完后立即清空引用，辅助 GC
-                batch.clear();
-
-                // 本批实际获取条数小于 fetchSize，说明已是最后一批
-                if (fetchedSize < fetchSize) {
-                    break;
-                }
-            }
-
-            // 释放当年汇率 Map 内存
-            forexMap.clear();
-            log.info("[{}年] 迁移完成，本年共处理 {} 条", year, processedInYear);
-
-        } finally {
-            // 恢复线程名
-            Thread.currentThread().setName(originalThreadName);
-        }
-    }
-
-    /**
-     * 处理一批数据：构建 PO 列表并写入 Oracle
-     */
-    private void processBatch(List<CashVoucherWithRequestDTO> batch,
-                              Map<String, TransactionTypesPO> txnMoneyMap,
-                              Map<String, TransactionTypesPO> txnActionMap,
-                              Map<String, ForexRatePO> forexMap,
-                              int batchIndex) {
-        List<McAcFundRecPO>    mcAcFundRecPOList    = new ArrayList<>(batch.size());
-        List<McAcFundTxnRecPO> mcAcFundTxnRecPOList = new ArrayList<>(batch.size());
-        List<McFundTpReltnPO>  mcFundTpReltnPOList  = new ArrayList<>(batch.size());
-        List<CashVoucherMapMSSEPO> cashVoucherMapMSSEPOList = new ArrayList<>(batch.size());
-
-        for (int i = 0; i < batch.size(); i++) {
-            CashVoucherWithRequestDTO items = batch.get(i);
-            Long mainId    = idGeneratorService.generateMainId();
-            Long acFundRid = idGeneratorService.generateDetailId();
-
-            // --- McAcFundTxnRecPO ---
-            McAcFundTxnRecPO mcAcFundTxnRecPO = new McAcFundTxnRecPO();
-            mcAcFundTxnRecPO.setAcFundTxnRid(mainId);
-            mcAcFundTxnRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
-            mcAcFundTxnRecPO.setIsRev("N");
-            mcAcFundTxnRecPO.setRevAcFundTxnRid(null);
-            mcAcFundTxnRecPO.setRecVerNum(0L);
-            mcAcFundTxnRecPO.setInitTime(LocalDateTime.now());
-            mcAcFundTxnRecPO.setLastUpdTime(LocalDateTime.now());
-            mcAcFundTxnRecPO.setLastUpdBy("MIG");
-            mcAcFundTxnRecPO.setTagSeq(0L);
-
-            // --- McAcFundRecPO ---
-            McAcFundRecPO mcAcFundRecPO = new McAcFundRecPO();
-            mcAcFundRecPO.setAcFundRid(acFundRid);
-            mcAcFundRecPO.setCmpnyIbusdate(items.getVoucherDate());
-            mcAcFundRecPO.setCmpnyBusdate(items.getVoucherDate());
-            mcAcFundRecPO.setAcId("02-0000389-30");
-            mcAcFundRecPO.setCcyCde(PropertyConverUtils.standardizeCurrencyCode(items.getCcy()));
-            mcAcFundRecPO.setSegrFundId(1L);
-            mcAcFundRecPO.setCmpnyCde("TFS");
-            mcAcFundRecPO.setTxnTypId(txnTypIdValueConvert(items.getTxnType(), txnMoneyMap));
-            mcAcFundRecPO.setValDate(items.getValueDate());
-            mcAcFundRecPO.setAmt(items.getAmount().abs());
-            mcAcFundRecPO.setIsNonAcHldr("N");
-            mcAcFundRecPO.setRemrk(items.getRemark());
-            mcAcFundRecPO.setBankCde(items.getSource());
-            mcAcFundRecPO.setPayeNam(items.getAccountName());
-            mcAcFundRecPO.setOthAcPayeNam(items.getBenfName());
-            mcAcFundRecPO.setClntBankCde(items.getSource());
-            mcAcFundRecPO.setClntBankAcNum(items.getAccountNumber());
-            mcAcFundRecPO.setIsPrtRcpt("N");
-            mcAcFundRecPO.setFundStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
-            mcAcFundRecPO.setFundChnlCde(Objects.equals(items.getManualInput(), "Yes") ? "MANUALINP" : "SYSTEM");
-            mcAcFundRecPO.setTxnTypActnCde(txnTypActnCdeValueCovert(items.getTxnType(), txnActionMap));
-            mcAcFundRecPO.setIsMemo("N");
-            mcAcFundRecPO.setIsChq(isChqAndIsTrnfrTrans(items, "chq"));
-            mcAcFundRecPO.setIsChrg(items.getCharge().contains("YES") ? "Y" : "N");
-            mcAcFundRecPO.setIsTrnfr(isChqAndIsTrnfrTrans(items, "trnfr"));
-            mcAcFundRecPO.setIsRev(isRevTrans(items));
-            mcAcFundRecPO.setIsDhon("N");
-            mcAcFundRecPO.setIsRtun("N");
-            mcAcFundRecPO.setIsUnderRevrse("N");
-            mcAcFundRecPO.setIsUnderDhon("N");
-            mcAcFundRecPO.setIsUnderRtun("N");
-            mcAcFundRecPO.setIsTodayRev(isTodayRevTrans(items));
-            mcAcFundRecPO.setIsTrigCreat("N");
-            mcAcFundRecPO.setPrimyRemrkFrStmt(items.getRemark());
-            mcAcFundRecPO.setBaseCcyEquAmt(baseCcyEquAmtValueProcess(items, forexMap));
-            mcAcFundRecPO.setIsAutoAprv("N");
-            mcAcFundRecPO.setIsIgnrDatSync("N");
-            mcAcFundRecPO.setRvisUnit("0031");
-            mcAcFundRecPO.setRvisBy("MIG");
-            mcAcFundRecPO.setLastRvisTime(LocalDateTime.now());
-            mcAcFundRecPO.setChkBy("MIG");
-            mcAcFundRecPO.setAprvRejCmpnyIbusdate(items.getApprovalTime());
-            mcAcFundRecPO.setAprvRejCmpnyBusdate(items.getApprovalTime());
-            mcAcFundRecPO.setAprvRejTime(items.getApprovalTime());
-            mcAcFundRecPO.setIsElectronic("N");
-            mcAcFundRecPO.setIsWork("N");
-            mcAcFundRecPO.setAcFundTxnRid(mainId);
-            mcAcFundRecPO.setIsOperateInFund("N");
-            mcAcFundRecPO.setIsInstrRelt("N");
-            mcAcFundRecPO.setIsPost("N");
-            mcAcFundRecPO.setRecVerNum(0L);
-            mcAcFundRecPO.setInitTime(LocalDateTime.now());
-            mcAcFundRecPO.setLastUpdTime(LocalDateTime.now());
-            mcAcFundRecPO.setLastUpdBy("MIG");
-            mcAcFundRecPO.setTagSeq(0L);
-            mcAcFundRecPO.setExtrnlRefNum(items.getMarket() + items.getVoucherNo());
-            mcAcFundRecPO.setExtrnlSysCde("OctOBack");
-            mcAcFundRecPO.setInitUser("MIG");
-            mcAcFundRecPO.setInitUserUnit("0031");
-            mcAcFundRecPO.setIsReact("N");
-            mcAcFundRecPO.setIsUnderReact("N");
-            mcAcFundRecPO.setIsNonRegBankAc("N");
-            mcAcFundRecPO.setFundTpReltnCde(items.getRelationship());
-
-            // --- McFundTpReltnPO ---
-            McFundTpReltnPO mcFundTpReltnPO = new McFundTpReltnPO();
-            mcFundTpReltnPO.setFundTpReltnCde(
-                    StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + i) : items.getRelationship());
-            mcFundTpReltnPO.setFundTpReltnDscr(
-                    StringUtils.isEmpty(items.getRelationship()) ? String.valueOf(5 + i) : items.getRelationship());
-            mcFundTpReltnPO.setFundTpReltnPri((long) (18 + i));
-            mcFundTpReltnPO.setIsInact("N");
-            mcFundTpReltnPO.setRecVerNum(0L);
-            mcFundTpReltnPO.setInitTime(LocalDateTime.now());
-            mcFundTpReltnPO.setLastUpdTime(LocalDateTime.now());
-            mcFundTpReltnPO.setLastUpdBy("MIG");
-            mcFundTpReltnPO.setTagSeq(0L);
-
-            // --- CashVoucherMapMSSEPO ---
-            CashVoucherMapMSSEPO cashVoucherMapMSSEPO = new CashVoucherMapMSSEPO();
-            cashVoucherMapMSSEPO.setVoucherNo(items.getVoucherNo());
-            cashVoucherMapMSSEPO.setMarket(items.getMarket());
-            cashVoucherMapMSSEPO.setAcFundRid(acFundRid);
-
-            mcAcFundRecPOList.add(mcAcFundRecPO);
-            mcAcFundTxnRecPOList.add(mcAcFundTxnRecPO);
-            mcFundTpReltnPOList.add(mcFundTpReltnPO);
-            cashVoucherMapMSSEPOList.add(cashVoucherMapMSSEPO);
-        }
-
-        // 写入 Oracle
-        saveToOracleMcAcFundTxn(mcAcFundTxnRecPOList);
-        saveToOracleMcAcFundRec(mcAcFundRecPOList);
-        saveToOracleMcFundTpReltn(mcFundTpReltnPOList);
-        cashVoucherMapMSSEMapper.insert(cashVoucherMapMSSEPOList, 1000);
-
-        // 写入完成后释放本批集合内存
-        mcAcFundRecPOList.clear();
-        mcAcFundTxnRecPOList.clear();
-        mcFundTpReltnPOList.clear();
-        cashVoucherMapMSSEPOList.clear();
-    }
-
-    // ==============================
-    // 辅助方法（使用预加载 Map，不再触发 N+1 查询）
-    // ==============================
-
-    /**
-     * 根据 txnType 从预加载 Map 中查找 txnTypId
-     * StkMoney='M'：C -> 1L，否则 -> 6L
-     */
-    private Long txnTypIdValueConvert(String code, Map<String, TransactionTypesPO> txnMoneyMap) {
-        TransactionTypesPO po = txnMoneyMap.get(code);
-        if (po == null || po.getSignIndicator() == null) {
-            return 6L;
-        }
-        return "C".equals(po.getSignIndicator()) ? 1L : 6L;
-    }
-
-    /**
-     * 根据 txnType 从预加载 Map 中查找 txnTypActnCde
-     * StkMoney='S'：C -> "IN"，否则 -> "OUT"
-     */
-    private String txnTypActnCdeValueCovert(String code, Map<String, TransactionTypesPO> txnActionMap) {
-        TransactionTypesPO po = txnActionMap.get(code);
-        if (po == null || po.getSignIndicator() == null) {
-            return "";
-        }
-        return "C".equals(po.getSignIndicator()) ? "IN" : "OUT";
-    }
-
-    /**
-     * 根据 CCY + confirmationDate 从预加载汇率 Map 中查找汇率并计算本币等值金额
-     */
-    private BigDecimal baseCcyEquAmtValueProcess(CashVoucherWithRequestDTO po,
-                                                  Map<String, ForexRatePO> forexMap) {
-        if (po.getConfirmationDate() == null) {
-            return BigDecimal.ZERO;
-        }
-        String dateStr = po.getConfirmationDate().toLocalDate().toString();
-        String key = buildForexKey(po.getCcy(), dateStr);
-        ForexRatePO forexRatePO = forexMap.get(key);
-        if (forexRatePO == null || forexRatePO.getXRate() == null) {
-            log.warn("未找到汇率：ccy={}, date={}", po.getCcy(), dateStr);
-            return BigDecimal.ZERO;
-        }
-        return po.getAmount().multiply(forexRatePO.getXRate()).setScale(8, RoundingMode.HALF_UP);
-    }
-
-    private String buildForexKey(String ccy, String dateStr) {
-        return ccy + "_" + dateStr;
-    }
-
-    private String isChqAndIsTrnfrTrans(CashVoucherWithRequestDTO items, String type) {
-        if (type.equals("chq")) {
-            if (!StringUtils.isEmpty(items.getMode())) {
-                return items.getMode().contains("CHQ") ? "Y" : "N";
-            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
-                return items.getWithdrawMode().contains("CHQ") ? "Y" : "N";
-            } else return "N";
-        } else {
-            if (!StringUtils.isEmpty(items.getMode())) {
-                return items.getMode().equals("3. INT TRF") ? "Y" : "N";
-            } else if (!StringUtils.isEmpty(items.getWithdrawMode())) {
-                return items.getWithdrawMode().equals("3. INT TRF") ? "Y" : "N";
-            } else return "N";
-        }
-    }
-
-    private String isRevTrans(CashVoucherWithRequestDTO items) {
-        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
-            if (!items.getCancelDate().equals(items.getConfirmationDate())
-                    && items.getStatus().contains("CAN")) {
-                return "Y";
-            }
-        }
-        return "N";
-    }
-
-    private String isTodayRevTrans(CashVoucherWithRequestDTO items) {
-        if (items.getCancelDate() != null && items.getConfirmationDate() != null) {
-            if (items.getCancelDate().equals(items.getConfirmationDate())
-                    && items.getStatus().contains("CAN")) {
-                return "Y";
-            }
-        }
-        return "N";
-    }
-
-    @DS("oracle")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveToOracleMcAcFundTxn(List<McAcFundTxnRecPO> list) {
-        mcAcFundTxnRecMapper.insert(list, 1000);
-    }
-
-    @DS("oracle")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveToOracleMcAcFundRec(List<McAcFundRecPO> list) {
-        mcAcFundRecMapper.insert(list, 1000);
-    }
-
-    @DS("oracle")
-    @Transactional(rollbackFor = Exception.class)
-    public void saveToOracleMcFundTpReltn(List<McFundTpReltnPO> list) {
-        mcFundTpReltnMapper.insert(list, 1000);
-    }
-}
-            
+2026-03-20 15:49:12 [main] INFO  org.example.DataMigrationApplication - Starting DataMigrationApplication using Java 11 on NTUATASIA15 with PID 16660 (C:\Users\appadm\IdeaProjects\sql-demo\target\classes started by appadm in C:\Users\appadm\IdeaProjects\sql-demo)
+2026-03-20 15:49:12 [main] INFO  org.example.DataMigrationApplication - The following 1 profile is active: "prod"
+2026-03-20 15:49:14 [main] INFO  o.s.b.w.e.tomcat.TomcatWebServer - Tomcat initialized with port(s): 8088 (http)
+2026-03-20 15:49:14 [main] INFO  o.a.catalina.core.StandardService - Starting service [Tomcat]
+2026-03-20 15:49:14 [main] INFO  o.a.catalina.core.StandardEngine - Starting Servlet engine: [Apache Tomcat/9.0.83]
+2026-03-20 15:49:14 [main] INFO  o.a.c.c.C.[Tomcat].[localhost].[/] - Initializing Spring embedded WebApplicationContext
+2026-03-20 15:49:14 [main] INFO  o.s.b.w.s.c.ServletWebServerApplicationContext - Root WebApplicationContext: initialization completed in 2790 ms
+2026-03-20 15:49:15 [main] INFO  com.zaxxer.hikari.HikariDataSource - master - Starting...
+2026-03-20 15:49:15 [main] INFO  com.zaxxer.hikari.HikariDataSource - master - Start completed.
+2026-03-20 15:49:15 [main] INFO  com.zaxxer.hikari.HikariDataSource - oracle - Starting...
+2026-03-20 15:49:16 [main] INFO  com.zaxxer.hikari.HikariDataSource - oracle - Start completed.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.BrokeragePO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.BrokerageRatePO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.CashTransferMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.CashTransferPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.CashVoucherMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.DivAnnCombineMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.DivAnnMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.DivAnnRightsMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.DivAnnSplitMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.HoldCashMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.HoldInstrumentMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.InstrumentVoucherMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:17 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.InterestDailyMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:18 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.McCeventPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+2026-03-20 15:49:19 [main] WARN  c.b.m.c.injector.DefaultSqlInjector - class org.example.pojo.PortfolioFeeDailyMapMSSEPO ,Not found @TableId annotation, Cannot use Mybatis-Plus 'xxById' Method.
+ _ _   |_  _ _|_. ___ _ |    _ 
+| | |\/|_)(_| | |_\  |_)||_|_\ 
+     /               |         
+                        3.5.13 
+2026-03-20 15:49:20 [main] WARN  o.s.b.c.c.a.DefaultBatchConfigurer - No datasource was provided...using a Map based JobRepository
+2026-03-20 15:49:20 [main] WARN  o.s.b.c.c.a.DefaultBatchConfigurer - No transaction manager was provided, using a ResourcelessTransactionManager
+2026-03-20 15:49:20 [main] INFO  o.s.b.c.l.support.SimpleJobLauncher - No TaskExecutor has been set, defaulting to synchronous executor.
+2026-03-20 15:49:20 [main] INFO  c.b.m.e.s.MybatisPlusApplicationContextAware - Register ApplicationContext instances org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext@19ae6bb
+2026-03-20 15:49:21 [main] INFO  o.s.b.w.e.tomcat.TomcatWebServer - Tomcat started on port(s): 8088 (http) with context path ''
+2026-03-20 15:49:21 [main] INFO  org.example.DataMigrationApplication - Started DataMigrationApplication in 10.105 seconds (JVM running for 11.154)
+2026-03-20 15:49:54 [http-nio-8088-exec-2] INFO  o.a.c.c.C.[Tomcat].[localhost].[/] - Initializing Spring DispatcherServlet 'dispatcherServlet'
+2026-03-20 15:49:54 [http-nio-8088-exec-2] INFO  o.s.web.servlet.DispatcherServlet - Initializing Servlet 'dispatcherServlet'
+2026-03-20 15:49:54 [http-nio-8088-exec-2] INFO  o.s.web.servlet.DispatcherServlet - Completed initialization in 2 ms
+2026-03-20 15:49:54 [http-nio-8088-exec-2] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - 迁移年份区间：2017 ~ 2026，共 10 年
+2026-03-20 15:49:55 [migration-year-2017] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2017年] 总记录数：82，本次处理上限：82，预计共 1 批
+2026-03-20 15:49:55 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 总记录数：1333245，本次处理上限：1333245，预计共 667 批
+2026-03-20 15:49:55 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 汇率预加载完成，共 1281 条
+2026-03-20 15:49:55 [migration-year-2017] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2017年] 汇率预加载完成，共 5162 条
+2026-03-20 15:49:55 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 总记录数：1835064，本次处理上限：1835064，预计共 918 批
+2026-03-20 15:49:55 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 汇率预加载完成，共 5840 条
+2026-03-20 15:49:55 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 总记录数：1796237，本次处理上限：1796237，预计共 899 批
+2026-03-20 15:49:55 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 汇率预加载完成，共 6448 条
+2026-03-20 15:49:55 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 总记录数：4306909，本次处理上限：4306909，预计共 2154 批
+2026-03-20 15:49:55 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 汇率预加载完成，共 7300 条
+2026-03-20 15:49:56 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 总记录数：4925097，本次处理上限：4925097，预计共 2463 批
+2026-03-20 15:49:56 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 汇率预加载完成，共 6916 条
+2026-03-20 15:49:57 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 总记录数：4942495，本次处理上限：4942495，预计共 2472 批
+2026-03-20 15:49:57 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 汇率预加载完成，共 7320 条
+2026-03-20 15:49:57 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 总记录数：3597892，本次处理上限：3597892，预计共 1799 批
+2026-03-20 15:49:57 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 汇率预加载完成，共 7135 条
+2026-03-20 15:50:00 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 总记录数：5820997，本次处理上限：5820997，预计共 2911 批
+2026-03-20 15:50:00 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 汇率预加载完成，共 6935 条
+2026-03-20 15:50:01 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 总记录数：6456847，本次处理上限：6456847，预计共 3229 批
+2026-03-20 15:50:01 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 汇率预加载完成，共 7508 条
+2026-03-20 15:50:06 [migration-year-2017] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2017年] 第 1/1 批，本批 82 条，开始处理
+2026-03-20 15:50:08 [migration-year-2017] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2017年] 已达本年处理上限 82 条，停止
+2026-03-20 15:50:08 [migration-year-2017] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2017年] 迁移完成，本年共处理 82 条
+2026-03-20 15:50:11 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 1/899 批，本批 2000 条，开始处理
+2026-03-20 15:50:11 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 1/918 批，本批 2000 条，开始处理
+2026-03-20 15:50:13 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 1/667 批，本批 2000 条，开始处理
+2026-03-20 15:50:13 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 1/2154 批，本批 2000 条，开始处理
+2026-03-20 15:50:13 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 1/2472 批，本批 2000 条，开始处理
+2026-03-20 15:50:14 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 1/1799 批，本批 2000 条，开始处理
+2026-03-20 15:50:14 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 1/2463 批，本批 2000 条，开始处理
+2026-03-20 15:50:15 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 1/2911 批，本批 2000 条，开始处理
+2026-03-20 15:50:15 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 1/3229 批，本批 2000 条，开始处理
+2026-03-20 15:50:17 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 2/899 批，本批 2000 条，开始处理
+2026-03-20 15:50:18 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 2/918 批，本批 2000 条，开始处理
+2026-03-20 15:50:28 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 2/2463 批，本批 2000 条，开始处理
+2026-03-20 15:50:33 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 3/918 批，本批 2000 条，开始处理
+2026-03-20 15:50:39 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 3/899 批，本批 2000 条，开始处理
+2026-03-20 15:50:39 [migration-year-2019] WARN  o.e.s.i.CashVoucherToMsseServiceImpl - 未找到汇率：ccy=AUD, date=2021-03-15
+2026-03-20 15:50:39 [migration-year-2019] WARN  o.e.s.i.CashVoucherToMsseServiceImpl - 未找到汇率：ccy=HKD, date=2021-03-15
+2026-03-20 15:50:40 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 2/667 批，本批 2000 条，开始处理
+2026-03-20 15:50:40 [migration-year-2026] WARN  o.e.s.i.CashVoucherToMsseServiceImpl - 未找到汇率：ccy=HKD, date=2025-12-31
+2026-03-20 15:50:40 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 2/2911 批，本批 2000 条，开始处理
+2026-03-20 15:50:42 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 2/1799 批，本批 2000 条，开始处理
+2026-03-20 15:50:42 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 3/2463 批，本批 2000 条，开始处理
+2026-03-20 15:50:42 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 2/2472 批，本批 2000 条，开始处理
+2026-03-20 15:50:42 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 4/918 批，本批 2000 条，开始处理
+2026-03-20 15:50:43 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 2/3229 批，本批 2000 条，开始处理
+2026-03-20 15:50:44 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 2/2154 批，本批 2000 条，开始处理
+2026-03-20 15:50:49 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 3/667 批，本批 2000 条，开始处理
+2026-03-20 15:50:50 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 4/2463 批，本批 2000 条，开始处理
+2026-03-20 15:50:57 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 3/2911 批，本批 2000 条，开始处理
+2026-03-20 15:51:04 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 5/918 批，本批 2000 条，开始处理
+2026-03-20 15:51:04 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 4/899 批，本批 2000 条，开始处理
+2026-03-20 15:51:09 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 4/667 批，本批 2000 条，开始处理
+2026-03-20 15:51:09 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 3/3229 批，本批 2000 条，开始处理
+2026-03-20 15:51:09 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 3/1799 批，本批 2000 条，开始处理
+2026-03-20 15:51:10 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 3/2154 批，本批 2000 条，开始处理
+2026-03-20 15:51:14 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 5/2463 批，本批 2000 条，开始处理
+2026-03-20 15:51:14 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 3/2472 批，本批 2000 条，开始处理
+2026-03-20 15:51:16 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 4/2911 批，本批 2000 条，开始处理
+2026-03-20 15:51:25 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 6/918 批，本批 2000 条，开始处理
+2026-03-20 15:51:26 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 5/899 批，本批 2000 条，开始处理
+2026-03-20 15:51:29 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 5/2911 批，本批 2000 条，开始处理
+2026-03-20 15:51:29 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 4/2154 批，本批 2000 条，开始处理
+2026-03-20 15:51:30 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 4/1799 批，本批 2000 条，开始处理
+2026-03-20 15:51:31 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 5/667 批，本批 2000 条，开始处理
+2026-03-20 15:51:33 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 4/3229 批，本批 2000 条，开始处理
+2026-03-20 15:51:47 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 4/2472 批，本批 2000 条，开始处理
+2026-03-20 15:51:47 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 6/899 批，本批 2000 条，开始处理
+2026-03-20 15:51:47 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 6/2463 批，本批 2000 条，开始处理
+2026-03-20 15:51:48 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 7/918 批，本批 2000 条，开始处理
+2026-03-20 15:51:49 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 6/667 批，本批 2000 条，开始处理
+2026-03-20 15:51:49 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 6/2911 批，本批 2000 条，开始处理
+2026-03-20 15:51:50 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 5/2154 批，本批 2000 条，开始处理
+2026-03-20 15:51:51 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 5/1799 批，本批 2000 条，开始处理
+2026-03-20 15:51:57 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 7/899 批，本批 2000 条，开始处理
+2026-03-20 15:51:58 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 5/3229 批，本批 2000 条，开始处理
+2026-03-20 15:52:01 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 8/918 批，本批 2000 条，开始处理
+2026-03-20 15:52:03 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 5/2472 批，本批 2000 条，开始处理
+2026-03-20 15:52:11 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 7/2911 批，本批 2000 条，开始处理
+2026-03-20 15:52:12 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 6/2154 批，本批 2000 条，开始处理
+2026-03-20 15:52:14 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 8/899 批，本批 2000 条，开始处理
+2026-03-20 15:52:18 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 9/918 批，本批 2000 条，开始处理
+2026-03-20 15:52:19 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 7/667 批，本批 2000 条，开始处理
+2026-03-20 15:52:23 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 7/2463 批，本批 2000 条，开始处理
+2026-03-20 15:52:28 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 6/2472 批，本批 2000 条，开始处理
+2026-03-20 15:52:30 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 6/3229 批，本批 2000 条，开始处理
+2026-03-20 15:52:30 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 8/2911 批，本批 2000 条，开始处理
+2026-03-20 15:52:31 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 6/1799 批，本批 2000 条，开始处理
+2026-03-20 15:52:31 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 9/899 批，本批 2000 条，开始处理
+2026-03-20 15:52:31 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 7/2154 批，本批 2000 条，开始处理
+2026-03-20 15:52:33 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 10/918 批，本批 2000 条，开始处理
+2026-03-20 15:52:41 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 8/667 批，本批 2000 条，开始处理
+2026-03-20 15:52:43 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 8/2463 批，本批 2000 条，开始处理
+2026-03-20 15:52:45 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 7/2472 批，本批 2000 条，开始处理
+2026-03-20 15:52:48 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 11/918 批，本批 2000 条，开始处理
+2026-03-20 15:52:50 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 8/2154 批，本批 2000 条，开始处理
+2026-03-20 15:52:51 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 7/1799 批，本批 2000 条，开始处理
+2026-03-20 15:52:52 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 10/899 批，本批 2000 条，开始处理
+2026-03-20 15:52:59 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 9/2911 批，本批 2000 条，开始处理
+2026-03-20 15:53:01 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 12/918 批，本批 2000 条，开始处理
+2026-03-20 15:53:01 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 9/667 批，本批 2000 条，开始处理
+2026-03-20 15:53:02 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 7/3229 批，本批 2000 条，开始处理
+2026-03-20 15:53:02 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 9/2463 批，本批 2000 条，开始处理
+2026-03-20 15:53:03 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 8/2472 批，本批 2000 条，开始处理
+2026-03-20 15:53:03 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 9/2154 批，本批 2000 条，开始处理
+2026-03-20 15:53:03 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 11/899 批，本批 2000 条，开始处理
+2026-03-20 15:53:23 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 8/1799 批，本批 2000 条，开始处理
+2026-03-20 15:53:25 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 12/899 批，本批 2000 条，开始处理
+2026-03-20 15:53:26 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 13/918 批，本批 2000 条，开始处理
+2026-03-20 15:53:26 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 10/667 批，本批 2000 条，开始处理
+2026-03-20 15:53:26 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 10/2911 批，本批 2000 条，开始处理
+2026-03-20 15:53:28 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 10/2463 批，本批 2000 条，开始处理
+2026-03-20 15:53:29 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 10/2154 批，本批 2000 条，开始处理
+2026-03-20 15:53:29 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 8/3229 批，本批 2000 条，开始处理
+2026-03-20 15:53:29 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 9/2472 批，本批 2000 条，开始处理
+2026-03-20 15:53:39 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 13/899 批，本批 2000 条，开始处理
+2026-03-20 15:53:40 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 14/918 批，本批 2000 条，开始处理
+2026-03-20 15:53:40 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 11/2463 批，本批 2000 条，开始处理
+2026-03-20 16:07:39 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 42/1799 批，本批 2000 条，开始处理
+2026-03-20 16:07:39 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 46/2463 批，本批 2000 条，开始处理
+2026-03-20 16:07:42 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 41/2472 批，本批 2000 条，开始处理
+2026-03-20 16:07:54 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 56/918 批，本批 2000 条，开始处理
+2026-03-20 16:07:59 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 52/667 批，本批 2000 条，开始处理
+2026-03-20 16:08:00 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 58/899 批，本批 2000 条，开始处理
+2026-03-20 16:08:00 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 47/2463 批，本批 2000 条，开始处理
+2026-03-20 16:08:00 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 43/2154 批，本批 2000 条，开始处理
+2026-03-20 16:08:00 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 43/1799 批，本批 2000 条，开始处理
+2026-03-20 16:08:02 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 37/3229 批，本批 2000 条，开始处理
+2026-03-20 16:08:02 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 57/918 批，本批 2000 条，开始处理
+2026-03-20 16:08:03 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 45/2911 批，本批 2000 条，开始处理
+2026-03-20 16:08:10 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 42/2472 批，本批 2000 条，开始处理
+2026-03-20 16:08:12 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 53/667 批，本批 2000 条，开始处理
+2026-03-20 16:08:24 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 48/2463 批，本批 2000 条，开始处理
+2026-03-20 16:08:24 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 44/1799 批，本批 2000 条，开始处理
+2026-03-20 16:08:25 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 46/2911 批，本批 2000 条，开始处理
+2026-03-20 16:08:25 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 59/899 批，本批 2000 条，开始处理
+2026-03-20 16:08:28 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 44/2154 批，本批 2000 条，开始处理
+2026-03-20 16:08:35 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 45/1799 批，本批 2000 条，开始处理
+2026-03-20 16:08:36 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 43/2472 批，本批 2000 条，开始处理
+2026-03-20 16:08:39 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 38/3229 批，本批 2000 条，开始处理
+2026-03-20 16:08:40 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 60/899 批，本批 2000 条，开始处理
+2026-03-20 16:08:43 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 54/667 批，本批 2000 条，开始处理
+2026-03-20 16:08:46 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 58/918 批，本批 2000 条，开始处理
+2026-03-20 16:08:48 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 47/2911 批，本批 2000 条，开始处理
+2026-03-20 16:08:50 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 45/2154 批，本批 2000 条，开始处理
+2026-03-20 16:08:50 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 49/2463 批，本批 2000 条，开始处理
+2026-03-20 16:08:58 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 39/3229 批，本批 2000 条，开始处理
+2026-03-20 16:09:03 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 48/2911 批，本批 2000 条，开始处理
+2026-03-20 16:09:03 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 44/2472 批，本批 2000 条，开始处理
+2026-03-20 16:09:04 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 46/1799 批，本批 2000 条，开始处理
+2026-03-20 16:09:06 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 50/2463 批，本批 2000 条，开始处理
+2026-03-20 16:09:11 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 61/899 批，本批 2000 条，开始处理
+2026-03-20 16:09:15 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 55/667 批，本批 2000 条，开始处理
+2026-03-20 16:09:16 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 59/918 批，本批 2000 条，开始处理
+2026-03-20 16:09:18 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 46/2154 批，本批 2000 条，开始处理
+2026-03-20 16:09:19 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 47/1799 批，本批 2000 条，开始处理
+2026-03-20 16:09:21 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 45/2472 批，本批 2000 条，开始处理
+2026-03-20 16:09:22 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 62/899 批，本批 2000 条，开始处理
+2026-03-20 16:09:23 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 51/2463 批，本批 2000 条，开始处理
+2026-03-20 16:09:23 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 40/3229 批，本批 2000 条，开始处理
+2026-03-20 16:09:27 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 49/2911 批，本批 2000 条，开始处理
+2026-03-20 16:09:37 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 60/918 批，本批 2000 条，开始处理
+2026-03-20 16:09:38 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 63/899 批，本批 2000 条，开始处理
+2026-03-20 16:09:38 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 56/667 批，本批 2000 条，开始处理
+2026-03-20 16:09:38 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 47/2154 批，本批 2000 条，开始处理
+2026-03-20 16:09:48 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 52/2463 批，本批 2000 条，开始处理
+2026-03-20 16:09:51 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 41/3229 批，本批 2000 条，开始处理
+2026-03-20 16:09:51 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 61/918 批，本批 2000 条，开始处理
+2026-03-20 16:09:51 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 46/2472 批，本批 2000 条，开始处理
+2026-03-20 16:09:51 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 57/667 批，本批 2000 条，开始处理
+2026-03-20 16:09:52 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 48/2154 批，本批 2000 条，开始处理
+2026-03-20 16:09:52 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 64/899 批，本批 2000 条，开始处理
+2026-03-20 16:09:52 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 48/1799 批，本批 2000 条，开始处理
+2026-03-20 16:09:53 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 50/2911 批，本批 2000 条，开始处理
+2026-03-20 16:10:12 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 58/667 批，本批 2000 条，开始处理
+2026-03-20 16:10:13 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 62/918 批，本批 2000 条，开始处理
+2026-03-20 16:10:13 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 65/899 批，本批 2000 条，开始处理
+2026-03-20 16:10:14 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 49/2154 批，本批 2000 条，开始处理
+2026-03-20 16:10:14 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 53/2463 批，本批 2000 条，开始处理
+2026-03-20 16:10:25 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 47/2472 批，本批 2000 条，开始处理
+2026-03-20 16:10:25 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 59/667 批，本批 2000 条，开始处理
+2026-03-20 16:10:25 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 51/2911 批，本批 2000 条，开始处理
+2026-03-20 16:10:25 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 63/918 批，本批 2000 条，开始处理
+2026-03-20 16:10:26 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 54/2463 批，本批 2000 条，开始处理
+2026-03-20 16:10:28 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 49/1799 批，本批 2000 条，开始处理
+2026-03-20 16:10:33 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 42/3229 批，本批 2000 条，开始处理
+2026-03-20 16:10:41 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 50/1799 批，本批 2000 条，开始处理
+2026-03-20 16:10:41 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 55/2463 批，本批 2000 条，开始处理
+2026-03-20 16:10:47 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 50/2154 批，本批 2000 条，开始处理
+2026-03-20 16:10:48 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 52/2911 批，本批 2000 条，开始处理
+2026-03-20 16:10:58 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 66/899 批，本批 2000 条，开始处理
+2026-03-20 16:10:58 [migration-year-2018] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2018年] 第 64/918 批，本批 2000 条，开始处理
+2026-03-20 16:10:59 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 60/667 批，本批 2000 条，开始处理
+2026-03-20 16:11:00 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 43/3229 批，本批 2000 条，开始处理
+2026-03-20 16:11:00 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 56/2463 批，本批 2000 条，开始处理
+2026-03-20 16:11:01 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 51/1799 批，本批 2000 条，开始处理
+2026-03-20 16:11:02 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 48/2472 批，本批 2000 条，开始处理
+2026-03-20 16:11:07 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 51/2154 批，本批 2000 条，开始处理
+2026-03-20 16:11:08 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 53/2911 批，本批 2000 条，开始处理
+2026-03-20 16:11:23 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 52/2154 批，本批 2000 条，开始处理
+2026-03-20 16:11:24 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 52/1799 批，本批 2000 条，开始处理
+2026-03-20 16:11:24 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 67/899 批，本批 2000 条，开始处理
+2026-03-20 16:11:25 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 61/667 批，本批 2000 条，开始处理
+2026-03-20 16:11:27 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 44/3229 批，本批 2000 条，开始处理
+2026-03-20 16:11:28 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 54/2911 批，本批 2000 条，开始处理
+2026-03-20 16:11:38 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 49/2472 批，本批 2000 条，开始处理
+2026-03-20 16:11:41 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 62/667 批，本批 2000 条，开始处理
+2026-03-20 16:11:41 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 68/899 批，本批 2000 条，开始处理
+2026-03-20 16:11:42 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 53/1799 批，本批 2000 条，开始处理
+2026-03-20 16:11:42 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 53/2154 批，本批 2000 条，开始处理
+2026-03-20 16:11:42 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 57/2463 批，本批 2000 条，开始处理
+2026-03-20 16:11:45 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 55/2911 批，本批 2000 条，开始处理
+2026-03-20 16:12:00 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 63/667 批，本批 2000 条，开始处理
+2026-03-20 16:12:02 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 45/3229 批，本批 2000 条，开始处理
+2026-03-20 16:12:03 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 69/899 批，本批 2000 条，开始处理
+2026-03-20 16:12:03 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 56/2911 批，本批 2000 条，开始处理
+2026-03-20 16:12:03 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 58/2463 批，本批 2000 条，开始处理
+2026-03-20 16:12:03 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 54/2154 批，本批 2000 条，开始处理
+2026-03-20 16:12:05 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 54/1799 批，本批 2000 条，开始处理
+2026-03-20 16:12:15 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 50/2472 批，本批 2000 条，开始处理
+2026-03-20 16:12:19 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 55/2154 批，本批 2000 条，开始处理
+2026-03-20 16:12:24 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 55/1799 批，本批 2000 条，开始处理
+2026-03-20 16:12:24 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 64/667 批，本批 2000 条，开始处理
+2026-03-20 16:12:25 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 46/3229 批，本批 2000 条，开始处理
+2026-03-20 16:12:27 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 57/2911 批，本批 2000 条，开始处理
+2026-03-20 16:12:32 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 59/2463 批，本批 2000 条，开始处理
+2026-03-20 16:12:38 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 70/899 批，本批 2000 条，开始处理
+2026-03-20 16:12:40 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 51/2472 批，本批 2000 条，开始处理
+2026-03-20 16:12:40 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 65/667 批，本批 2000 条，开始处理
+2026-03-20 16:12:40 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 58/2911 批，本批 2000 条，开始处理
+2026-03-20 16:12:40 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 60/2463 批，本批 2000 条，开始处理
+2026-03-20 16:12:40 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 56/2154 批，本批 2000 条，开始处理
+2026-03-20 16:12:43 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 56/1799 批，本批 2000 条，开始处理
+2026-03-20 16:12:49 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 47/3229 批，本批 2000 条，开始处理
+2026-03-20 16:12:52 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 66/667 批，本批 2000 条，开始处理
+2026-03-20 16:12:55 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 71/899 批，本批 2000 条，开始处理
+2026-03-20 16:13:05 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 67/667 批，本批 2000 条，开始处理
+2026-03-20 16:13:05 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 72/899 批，本批 2000 条，开始处理
+2026-03-20 16:13:05 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 57/1799 批，本批 2000 条，开始处理
+2026-03-20 16:13:06 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 59/2911 批，本批 2000 条，开始处理
+2026-03-20 16:13:07 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 52/2472 批，本批 2000 条，开始处理
+2026-03-20 16:13:08 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 61/2463 批，本批 2000 条，开始处理
+2026-03-20 16:13:09 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 57/2154 批，本批 2000 条，开始处理
+2026-03-20 16:13:12 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 48/3229 批，本批 2000 条，开始处理
+2026-03-20 16:13:12 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 68/667 批，本批 2000 条，开始处理
+2026-03-20 16:13:12 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 73/899 批，本批 2000 条，开始处理
+2026-03-20 16:13:30 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 62/2463 批，本批 2000 条，开始处理
+2026-03-20 16:13:31 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 74/899 批，本批 2000 条，开始处理
+2026-03-20 16:13:31 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 69/667 批，本批 2000 条，开始处理
+2026-03-20 16:13:32 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 49/3229 批，本批 2000 条，开始处理
+2026-03-20 16:13:32 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 60/2911 批，本批 2000 条，开始处理
+2026-03-20 16:13:32 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 58/1799 批，本批 2000 条，开始处理
+2026-03-20 16:13:46 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 61/2911 批，本批 2000 条，开始处理
+2026-03-20 16:13:46 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 70/667 批，本批 2000 条，开始处理
+2026-03-20 16:13:48 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 53/2472 批，本批 2000 条，开始处理
+2026-03-20 16:13:48 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 75/899 批，本批 2000 条，开始处理
+2026-03-20 16:13:50 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 50/3229 批，本批 2000 条，开始处理
+2026-03-20 16:13:51 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 63/2463 批，本批 2000 条，开始处理
+2026-03-20 16:13:57 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 58/2154 批，本批 2000 条，开始处理
+2026-03-20 16:14:03 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 71/667 批，本批 2000 条，开始处理
+2026-03-20 16:14:03 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 76/899 批，本批 2000 条，开始处理
+2026-03-20 16:14:04 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 59/1799 批，本批 2000 条，开始处理
+2026-03-20 16:14:10 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 64/2463 批，本批 2000 条，开始处理
+2026-03-20 16:14:13 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 54/2472 批，本批 2000 条，开始处理
+2026-03-20 16:14:15 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 51/3229 批，本批 2000 条，开始处理
+2026-03-20 16:14:16 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 72/667 批，本批 2000 条，开始处理
+2026-03-20 16:14:17 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 77/899 批，本批 2000 条，开始处理
+2026-03-20 16:14:24 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 62/2911 批，本批 2000 条，开始处理
+2026-03-20 16:14:27 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 52/3229 批，本批 2000 条，开始处理
+2026-03-20 16:14:28 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 60/1799 批，本批 2000 条，开始处理
+2026-03-20 16:14:35 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 78/899 批，本批 2000 条，开始处理
+2026-03-20 16:14:35 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 59/2154 批，本批 2000 条，开始处理
+2026-03-20 16:14:35 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 73/667 批，本批 2000 条，开始处理
+2026-03-20 16:14:35 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 65/2463 批，本批 2000 条，开始处理
+2026-03-20 16:14:35 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 55/2472 批，本批 2000 条，开始处理
+2026-03-20 16:14:45 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 53/3229 批，本批 2000 条，开始处理
+2026-03-20 16:14:48 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 74/667 批，本批 2000 条，开始处理
+2026-03-20 16:14:48 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 61/1799 批，本批 2000 条，开始处理
+2026-03-20 16:14:53 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 79/899 批，本批 2000 条，开始处理
+2026-03-20 16:14:54 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 63/2911 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 80/899 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 56/2472 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 60/2154 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 62/1799 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 75/667 批，本批 2000 条，开始处理
+2026-03-20 16:15:05 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 54/3229 批，本批 2000 条，开始处理
+2026-03-20 16:15:07 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 64/2911 批，本批 2000 条，开始处理
+2026-03-20 16:15:09 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 66/2463 批，本批 2000 条，开始处理
+2026-03-20 16:15:10 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 81/899 批，本批 2000 条，开始处理
+2026-03-20 16:15:22 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 67/2463 批，本批 2000 条，开始处理
+2026-03-20 16:15:31 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 82/899 批，本批 2000 条，开始处理
+2026-03-20 16:15:32 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 76/667 批，本批 2000 条，开始处理
+2026-03-20 16:15:33 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 61/2154 批，本批 2000 条，开始处理
+2026-03-20 16:15:36 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 83/899 批，本批 2000 条，开始处理
+2026-03-20 16:15:36 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 63/1799 批，本批 2000 条，开始处理
+2026-03-20 16:15:36 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 55/3229 批，本批 2000 条，开始处理
+2026-03-20 16:15:37 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 57/2472 批，本批 2000 条，开始处理
+2026-03-20 16:15:38 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 68/2463 批，本批 2000 条，开始处理
+2026-03-20 16:15:40 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 65/2911 批，本批 2000 条，开始处理
+2026-03-20 16:15:54 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 66/2911 批，本批 2000 条，开始处理
+2026-03-20 16:15:56 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 77/667 批，本批 2000 条，开始处理
+2026-03-20 16:15:56 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 84/899 批，本批 2000 条，开始处理
+2026-03-20 16:15:56 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 62/2154 批，本批 2000 条，开始处理
+2026-03-20 16:16:01 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 58/2472 批，本批 2000 条，开始处理
+2026-03-20 16:16:08 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 69/2463 批，本批 2000 条，开始处理
+2026-03-20 16:16:09 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 78/667 批，本批 2000 条，开始处理
+2026-03-20 16:16:10 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 85/899 批，本批 2000 条，开始处理
+2026-03-20 16:16:10 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 56/3229 批，本批 2000 条，开始处理
+2026-03-20 16:16:16 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 64/1799 批，本批 2000 条，开始处理
+2026-03-20 16:16:18 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 63/2154 批，本批 2000 条，开始处理
+2026-03-20 16:16:24 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 59/2472 批，本批 2000 条，开始处理
+2026-03-20 16:16:24 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 67/2911 批，本批 2000 条，开始处理
+2026-03-20 16:16:25 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 70/2463 批，本批 2000 条，开始处理
+2026-03-20 16:16:26 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 57/3229 批，本批 2000 条，开始处理
+2026-03-20 16:16:27 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 86/899 批，本批 2000 条，开始处理
+2026-03-20 16:16:28 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 79/667 批，本批 2000 条，开始处理
+2026-03-20 16:16:28 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 65/1799 批，本批 2000 条，开始处理
+2026-03-20 16:16:45 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 80/667 批，本批 2000 条，开始处理
+2026-03-20 16:16:45 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 87/899 批，本批 2000 条，开始处理
+2026-03-20 16:16:45 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 71/2463 批，本批 2000 条，开始处理
+2026-03-20 16:16:46 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 58/3229 批，本批 2000 条，开始处理
+2026-03-20 16:16:46 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 64/2154 批，本批 2000 条，开始处理
+2026-03-20 16:16:47 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 66/1799 批，本批 2000 条，开始处理
+2026-03-20 16:16:54 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 60/2472 批，本批 2000 条，开始处理
+2026-03-20 16:16:56 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 68/2911 批，本批 2000 条，开始处理
+2026-03-20 16:17:02 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 88/899 批，本批 2000 条，开始处理
+2026-03-20 16:17:03 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 67/1799 批，本批 2000 条，开始处理
+2026-03-20 16:17:06 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 81/667 批，本批 2000 条，开始处理
+2026-03-20 16:17:16 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 61/2472 批，本批 2000 条，开始处理
+2026-03-20 16:17:16 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 59/3229 批，本批 2000 条，开始处理
+2026-03-20 16:17:16 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 82/667 批，本批 2000 条，开始处理
+2026-03-20 16:17:17 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 89/899 批，本批 2000 条，开始处理
+2026-03-20 16:17:18 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 72/2463 批，本批 2000 条，开始处理
+2026-03-20 16:17:19 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 68/1799 批，本批 2000 条，开始处理
+2026-03-20 16:17:21 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 65/2154 批，本批 2000 条，开始处理
+2026-03-20 16:17:28 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 69/2911 批，本批 2000 条，开始处理
+2026-03-20 16:17:30 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 60/3229 批，本批 2000 条，开始处理
+2026-03-20 16:17:32 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 69/1799 批，本批 2000 条，开始处理
+2026-03-20 16:17:33 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 83/667 批，本批 2000 条，开始处理
+2026-03-20 16:17:41 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 90/899 批，本批 2000 条，开始处理
+2026-03-20 16:17:45 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 84/667 批，本批 2000 条，开始处理
+2026-03-20 16:17:54 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 61/3229 批，本批 2000 条，开始处理
+2026-03-20 16:17:54 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 62/2472 批，本批 2000 条，开始处理
+2026-03-20 16:17:54 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 66/2154 批，本批 2000 条，开始处理
+2026-03-20 16:17:55 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 91/899 批，本批 2000 条，开始处理
+2026-03-20 16:17:55 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 85/667 批，本批 2000 条，开始处理
+2026-03-20 16:17:55 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 73/2463 批，本批 2000 条，开始处理
+2026-03-20 16:17:55 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 70/1799 批，本批 2000 条，开始处理
+2026-03-20 16:18:01 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 70/2911 批，本批 2000 条，开始处理
+2026-03-20 16:18:16 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 74/2463 批，本批 2000 条，开始处理
+2026-03-20 16:18:17 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 86/667 批，本批 2000 条，开始处理
+2026-03-20 16:18:17 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 92/899 批，本批 2000 条，开始处理
+2026-03-20 16:18:23 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 71/2911 批，本批 2000 条，开始处理
+2026-03-20 16:18:24 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 62/3229 批，本批 2000 条，开始处理
+2026-03-20 16:18:30 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 71/1799 批，本批 2000 条，开始处理
+2026-03-20 16:18:34 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 93/899 批，本批 2000 条，开始处理
+2026-03-20 16:18:35 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 87/667 批，本批 2000 条，开始处理
+2026-03-20 16:18:43 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 67/2154 批，本批 2000 条，开始处理
+2026-03-20 16:18:50 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 63/2472 批，本批 2000 条，开始处理
+2026-03-20 16:18:52 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 75/2463 批，本批 2000 条，开始处理
+2026-03-20 16:18:52 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 72/2911 批，本批 2000 条，开始处理
+2026-03-20 16:18:54 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 63/3229 批，本批 2000 条，开始处理
+2026-03-20 16:18:55 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 88/667 批，本批 2000 条，开始处理
+2026-03-20 16:18:58 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 72/1799 批，本批 2000 条，开始处理
+2026-03-20 16:18:59 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 94/899 批，本批 2000 条，开始处理
+2026-03-20 16:19:14 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 89/667 批，本批 2000 条，开始处理
+2026-03-20 16:19:15 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 95/899 批，本批 2000 条，开始处理
+2026-03-20 16:19:16 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 76/2463 批，本批 2000 条，开始处理
+2026-03-20 16:19:24 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 68/2154 批，本批 2000 条，开始处理
+2026-03-20 16:19:29 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 64/2472 批，本批 2000 条，开始处理
+2026-03-20 16:19:29 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 90/667 批，本批 2000 条，开始处理
+2026-03-20 16:19:30 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 96/899 批，本批 2000 条，开始处理
+2026-03-20 16:19:30 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 64/3229 批，本批 2000 条，开始处理
+2026-03-20 16:19:31 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 77/2463 批，本批 2000 条，开始处理
+2026-03-20 16:19:31 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 73/2911 批，本批 2000 条，开始处理
+2026-03-20 16:19:35 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 73/1799 批，本批 2000 条，开始处理
+2026-03-20 16:19:44 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 91/667 批，本批 2000 条，开始处理
+2026-03-20 16:19:44 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 69/2154 批，本批 2000 条，开始处理
+2026-03-20 16:19:44 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 78/2463 批，本批 2000 条，开始处理
+2026-03-20 16:19:56 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 92/667 批，本批 2000 条，开始处理
+2026-03-20 16:19:57 [migration-year-2021] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2021年] 第 74/2911 批，本批 2000 条，开始处理
+2026-03-20 16:20:03 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 74/1799 批，本批 2000 条，开始处理
+2026-03-20 16:20:05 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 93/667 批，本批 2000 条，开始处理
+2026-03-20 16:20:11 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 65/3229 批，本批 2000 条，开始处理
+2026-03-20 16:20:12 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 65/2472 批，本批 2000 条，开始处理
+2026-03-20 16:20:15 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 94/667 批，本批 2000 条，开始处理
+2026-03-20 16:20:15 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 79/2463 批，本批 2000 条，开始处理
+2026-03-20 16:20:15 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 70/2154 批，本批 2000 条，开始处理
+2026-03-20 16:20:16 [migration-year-2021] WARN  c.zaxxer.hikari.pool.ProxyConnection - oracle - Connection oracle.jdbc.driver.T4CConnection@7882c9a3 marked as broken because of SQLSTATE(08006), ErrorCode(17002)
+java.sql.BatchUpdateException: IO Error: An existing connection was forcibly closed by the remote host
+	at oracle.jdbc.driver.OraclePreparedStatement.generateBatchUpdateException(OraclePreparedStatement.java:10345)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeBatchWithoutQueue(OraclePreparedStatement.java:10107)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeLargeBatch(OraclePreparedStatement.java:9987)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeBatch(OraclePreparedStatement.java:9939)
+	at oracle.jdbc.driver.OracleStatementWrapper.executeBatch(OracleStatementWrapper.java:261)
+	at com.zaxxer.hikari.pool.ProxyStatement.executeBatch(ProxyStatement.java:127)
+	at com.zaxxer.hikari.pool.HikariProxyPreparedStatement.executeBatch(HikariProxyPreparedStatement.java)
+	at org.apache.ibatis.executor.BatchExecutor.doFlushStatements(BatchExecutor.java:126)
+	at org.apache.ibatis.executor.BaseExecutor.flushStatements(BaseExecutor.java:129)
+	at org.apache.ibatis.executor.BaseExecutor.flushStatements(BaseExecutor.java:122)
+	at org.apache.ibatis.executor.CachingExecutor.flushStatements(CachingExecutor.java:115)
+	at org.apache.ibatis.session.defaults.DefaultSqlSession.flushStatements(DefaultSqlSession.java:252)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:149)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:130)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:118)
+	at com.baomidou.mybatisplus.core.toolkit.MybatisBatchUtils.execute(MybatisBatchUtils.java:175)
+	at com.baomidou.mybatisplus.core.mapper.BaseMapper.insert(BaseMapper.java:517)
+	at java.base/java.lang.invoke.MethodHandle.invokeWithArguments(MethodHandle.java:710)
+	at com.baomidou.mybatisplus.core.override.MybatisMapperProxy$DefaultMethodInvoker.invoke(MybatisMapperProxy.java:182)
+	at com.baomidou.mybatisplus.core.override.MybatisMapperProxy.invoke(MybatisMapperProxy.java:93)
+	at com.sun.proxy.$Proxy124.insert(Unknown Source)
+	at jdk.internal.reflect.GeneratedMethodAccessor214.invoke(Unknown Source)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:344)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:198)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at com.baomidou.dynamic.datasource.aop.DynamicDataSourceAnnotationInterceptor.invoke(DynamicDataSourceAnnotationInterceptor.java:57)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:186)
+	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:241)
+	at com.sun.proxy.$Proxy125.insert(Unknown Source)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.saveToOracleMcAcFundRec(CashVoucherToMsseServiceImpl.java:503)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.processBatch(CashVoucherToMsseServiceImpl.java:397)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.processOneYear(CashVoucherToMsseServiceImpl.java:242)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.lambda$writeProcessedData$4(CashVoucherToMsseServiceImpl.java:126)
+	at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run$$$capture(CompletableFuture.java:1736)
+	at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run(CompletableFuture.java)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+	at java.base/java.lang.Thread.run(Thread.java:834)
+2026-03-20 16:20:16 [migration-year-2021] ERROR o.e.s.i.CashVoucherToMsseServiceImpl - error log
+org.apache.ibatis.exceptions.PersistenceException: 
+### Error flushing statements.  Cause: org.apache.ibatis.executor.BatchExecutorException: org.example.mapper.McAcFundRecMapper.insert (batch index #1) failed. Cause: java.sql.BatchUpdateException: IO Error: An existing connection was forcibly closed by the remote host
+### Cause: org.apache.ibatis.executor.BatchExecutorException: org.example.mapper.McAcFundRecMapper.insert (batch index #1) failed. Cause: java.sql.BatchUpdateException: IO Error: An existing connection was forcibly closed by the remote host
+	at org.apache.ibatis.exceptions.ExceptionFactory.wrapException(ExceptionFactory.java:30)
+	at org.apache.ibatis.session.defaults.DefaultSqlSession.flushStatements(DefaultSqlSession.java:254)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:149)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:130)
+	at com.baomidou.mybatisplus.core.batch.MybatisBatch.execute(MybatisBatch.java:118)
+	at com.baomidou.mybatisplus.core.toolkit.MybatisBatchUtils.execute(MybatisBatchUtils.java:175)
+	at com.baomidou.mybatisplus.core.mapper.BaseMapper.insert(BaseMapper.java:517)
+	at java.base/java.lang.invoke.MethodHandle.invokeWithArguments(MethodHandle.java:710)
+	at com.baomidou.mybatisplus.core.override.MybatisMapperProxy$DefaultMethodInvoker.invoke(MybatisMapperProxy.java:182)
+	at com.baomidou.mybatisplus.core.override.MybatisMapperProxy.invoke(MybatisMapperProxy.java:93)
+	at com.sun.proxy.$Proxy124.insert(Unknown Source)
+	at jdk.internal.reflect.GeneratedMethodAccessor214.invoke(Unknown Source)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:344)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:198)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at com.baomidou.dynamic.datasource.aop.DynamicDataSourceAnnotationInterceptor.invoke(DynamicDataSourceAnnotationInterceptor.java:57)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:186)
+	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:241)
+	at com.sun.proxy.$Proxy125.insert(Unknown Source)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.saveToOracleMcAcFundRec(CashVoucherToMsseServiceImpl.java:503)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.processBatch(CashVoucherToMsseServiceImpl.java:397)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.processOneYear(CashVoucherToMsseServiceImpl.java:242)
+	at org.example.service.impl.CashVoucherToMsseServiceImpl.lambda$writeProcessedData$4(CashVoucherToMsseServiceImpl.java:126)
+	at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run$$$capture(CompletableFuture.java:1736)
+	at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run(CompletableFuture.java)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+	at java.base/java.lang.Thread.run(Thread.java:834)
+Caused by: org.apache.ibatis.executor.BatchExecutorException: org.example.mapper.McAcFundRecMapper.insert (batch index #1) failed. Cause: java.sql.BatchUpdateException: IO Error: An existing connection was forcibly closed by the remote host
+	at org.apache.ibatis.executor.BatchExecutor.doFlushStatements(BatchExecutor.java:148)
+	at org.apache.ibatis.executor.BaseExecutor.flushStatements(BaseExecutor.java:129)
+	at org.apache.ibatis.executor.BaseExecutor.flushStatements(BaseExecutor.java:122)
+	at org.apache.ibatis.executor.CachingExecutor.flushStatements(CachingExecutor.java:115)
+	at org.apache.ibatis.session.defaults.DefaultSqlSession.flushStatements(DefaultSqlSession.java:252)
+	... 28 common frames omitted
+Caused by: java.sql.BatchUpdateException: IO Error: An existing connection was forcibly closed by the remote host
+	at oracle.jdbc.driver.OraclePreparedStatement.generateBatchUpdateException(OraclePreparedStatement.java:10345)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeBatchWithoutQueue(OraclePreparedStatement.java:10107)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeLargeBatch(OraclePreparedStatement.java:9987)
+	at oracle.jdbc.driver.OraclePreparedStatement.executeBatch(OraclePreparedStatement.java:9939)
+	at oracle.jdbc.driver.OracleStatementWrapper.executeBatch(OracleStatementWrapper.java:261)
+	at com.zaxxer.hikari.pool.ProxyStatement.executeBatch(ProxyStatement.java:127)
+	at com.zaxxer.hikari.pool.HikariProxyPreparedStatement.executeBatch(HikariProxyPreparedStatement.java)
+	at org.apache.ibatis.executor.BatchExecutor.doFlushStatements(BatchExecutor.java:126)
+	... 32 common frames omitted
+2026-03-20 16:20:18 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 97/899 批，本批 2000 条，开始处理
+2026-03-20 16:20:26 [migration-year-2024] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2024年] 第 66/2472 批，本批 2000 条，开始处理
+2026-03-20 16:20:28 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 95/667 批，本批 2000 条，开始处理
+2026-03-20 16:20:30 [migration-year-2022] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2022年] 第 75/1799 批，本批 2000 条，开始处理
+2026-03-20 16:20:32 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 71/2154 批，本批 2000 条，开始处理
+2026-03-20 16:20:38 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 98/899 批，本批 2000 条，开始处理
+2026-03-20 16:20:38 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 96/667 批，本批 2000 条，开始处理
+2026-03-20 16:20:42 [migration-year-2025] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2025年] 第 66/3229 批，本批 2000 条，开始处理
+2026-03-20 16:20:47 [migration-year-2023] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2023年] 第 72/2154 批，本批 2000 条，开始处理
+2026-03-20 16:20:54 [migration-year-2020] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2020年] 第 80/2463 批，本批 2000 条，开始处理
+2026-03-20 16:20:56 [migration-year-2026] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2026年] 第 97/667 批，本批 2000 条，开始处理
+2026-03-20 16:20:57 [migration-year-2019] INFO  o.e.s.i.CashVoucherToMsseServiceImpl - [2019年] 第 99/899 批，本批 2000 条，开始处理
