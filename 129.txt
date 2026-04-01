@@ -1,22 +1,568 @@
-         // 写入 Oracle（带重试机制，与查询侧对齐，防止网络抖动导致批次数据丢失）
-        saveToOracleWithRetry("McAcFundTxnRec", batchIndex, () -> saveToOracleMcAcFundTxn(mcAcFundTxnRecPOList));
-        saveToOracleWithRetry("McAcFundRec",    batchIndex, () -> saveToOracleMcAcFundRec(mcAcFundRecPOList));
-        saveToOracleWithRetry("McFundTpReltn",  batchIndex, () -> saveToOracleMcFundTpReltn(mcFundTpReltnPOList));
-        // CashVoucherMapMSSE 是 SQL Server 侧的映射表（@DS("master")），直接写入，不走 Oracle 重试
-        cashVoucherMapMSSEMapper.insert(cashVoucherMapMSSEPOList, 1000);
+    @GetMapping("/instrumentVoucherTable/test")
+    public String instrumentVoucherTable(@RequestParam(defaultValue = "1000000") int limit) {
+        return instrumentVoucherToMsseService.writeProcessedData(limit);
+    }
+
+    String writeProcessedData();
+
+    String writeProcessedData(long maxRows);
 
 
-        /**
+package org.example.service.impl;
+
+import com.baomidou.dynamic.datasource.annotation.DS;
+import lombok.extern.slf4j.Slf4j;
+import org.example.mapper.*;
+import org.example.pojo.*;
+import org.example.service.IdGeneratorService;
+import org.example.service.InstrumentVoucherToMsseService;
+import org.example.utils.PropertyConverUtils;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+/**
+ * InstrumentVoucher 迁移至 MSSE 服务实现
+ * 1. 按 VoucherDate 年份区间多线程并行处理
+ * 2. 每年内部分批分页轮询，避免 OOM
+ * 3. TransactionTypes / McMrkt 全局预加载一次；McInstr / McInstclVer 批次内预加载，彻底消除 N+1
+ *
+ * @author JackChen
+ * @since 2025-12-19
+ */
+@Service
+@Slf4j
+public class InstrumentVoucherToMsseServiceImpl implements InstrumentVoucherToMsseService {
+
+    private final InstrumentVoucherMapper instrumentVoucherMapper;
+    private final TransactionTypesMapper transactionTypesMapper;
+    private final InstrumentVoucherMapMSSEMapper instrumentVoucherMapMSSEMapper;
+    private final McAcStkTxnDtlMapper mcAcStkTxnDtlMapper;
+    private final McAcStkTxnDtlStatMapper mcAcStkTxnDtlStatMapper;
+    private final McInstrMapper mcInstrMapper;
+    private final McStkTxnMapper mcStkTxnMapper;
+    private final McMrktMapper mcMrktMapper;
+    private final McInstclVerMapper mcInstclVerMapper;
+    private final McStkMemoTxnMapper mcStkMemoTxnMapper;
+    private final McStkMemoTxnReqMapper mcStkMemoTxnReqMapper;
+    private final McLoctnStkTxnDtlMapper mcLoctnStkTxnDtlMapper;
+    private final IdGeneratorService idGeneratorService;
+    private static final int PAGE_SIZE = 1000;
+    private final ThreadPoolExecutor migrationThreadPool;
+
+    public InstrumentVoucherToMsseServiceImpl(
+            InstrumentVoucherMapper instrumentVoucherMapper,
+            TransactionTypesMapper transactionTypesMapper,
+            InstrumentVoucherMapMSSEMapper instrumentVoucherMapMSSEMapper,
+            McAcStkTxnDtlMapper mcAcStkTxnDtlMapper,
+            McAcStkTxnDtlStatMapper mcAcStkTxnDtlStatMapper,
+            McInstrMapper mcInstrMapper,
+            McStkTxnMapper mcStkTxnMapper,
+            McMrktMapper mcMrktMapper,
+            McInstclVerMapper mcInstclVerMapper,
+            McStkMemoTxnMapper mcStkMemoTxnMapper,
+            McStkMemoTxnReqMapper mcStkMemoTxnReqMapper,
+            McLoctnStkTxnDtlMapper mcLoctnStkTxnDtlMapper,
+            IdGeneratorService idGeneratorService,
+            @Qualifier("migrationThreadPool") ThreadPoolExecutor migrationThreadPool) {
+        this.instrumentVoucherMapper = instrumentVoucherMapper;
+        this.transactionTypesMapper = transactionTypesMapper;
+        this.instrumentVoucherMapMSSEMapper = instrumentVoucherMapMSSEMapper;
+        this.mcAcStkTxnDtlMapper = mcAcStkTxnDtlMapper;
+        this.mcAcStkTxnDtlStatMapper = mcAcStkTxnDtlStatMapper;
+        this.mcInstrMapper = mcInstrMapper;
+        this.mcStkTxnMapper = mcStkTxnMapper;
+        this.mcMrktMapper = mcMrktMapper;
+        this.mcInstclVerMapper = mcInstclVerMapper;
+        this.mcStkMemoTxnMapper = mcStkMemoTxnMapper;
+        this.mcStkMemoTxnReqMapper = mcStkMemoTxnReqMapper;
+        this.mcLoctnStkTxnDtlMapper = mcLoctnStkTxnDtlMapper;
+        this.idGeneratorService = idGeneratorService;
+        this.migrationThreadPool = migrationThreadPool;
+    }
+
+    @Override
+    public String writeProcessedData() {
+        return writeProcessedData(0L);
+    }
+
+    @Override
+    public String writeProcessedData(long maxRows) {
+        LocalDateTime minDate = instrumentVoucherMapper.selectMinVoucherDate();
+        LocalDateTime maxDate = instrumentVoucherMapper.selectMaxVoucherDate();
+        if (minDate == null || maxDate == null) {
+            log.warn("InstrumentVoucher 表中无有效 VoucherDate 数据，跳过迁移");
+            return "no data";
+        }
+        int startYear = minDate.getYear();
+        int endYear   = maxDate.getYear();
+        boolean limited = maxRows > 0;
+        if (limited) log.info("[测试模式] 最大迁移行数限制：{} 条", maxRows);
+        log.info("迁移年份区间：{} ~ {}，共 {} 年", startYear, endYear, (endYear - startYear + 1));
+
+        // ① 全局预加载 TransactionTypes StkMoney='S'（全表很小，只查一次）
+        Map<String, TransactionTypesPO> txnActionMap = transactionTypesMapper.selectAllTxnTypeAction()
+                .stream().collect(Collectors.toMap(
+                        TransactionTypesPO::getTransactionTypes, po -> po, (a, b) -> a));
+
+        // ② 全局预加载 McMrkt（市场代码表全量，只查一次）
+        Map<String, Long> mrktCdeToIdMap = mcMrktMapper.findAllMrkt().stream()
+                .filter(po -> po.getMrktCde() != null && po.getMrktId() != null)
+                .collect(Collectors.toMap(McMrktPO::getMrktCde, McMrktPO::getMrktId, (a, b) -> a));
+
+        log.info("全局预加载完成：TransactionTypes={} 条，McMrkt={} 条",
+                txnActionMap.size(), mrktCdeToIdMap.size());
+
+        final AtomicLong remainingRows = new AtomicLong(limited ? maxRows : Long.MAX_VALUE);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int year = startYear; year <= endYear; year++) {
+            final int targetYear = year;
+            futures.add(CompletableFuture.runAsync(
+                    () -> processOneYear(targetYear, remainingRows, txnActionMap, mrktCdeToIdMap),
+                    migrationThreadPool));
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("迁移任务被中断", e);
+            return "interrupted";
+        } catch (ExecutionException e) {
+            log.error("迁移任务执行异常", e.getCause());
+            return "error: " + e.getCause().getMessage();
+        } finally {
+            txnActionMap.clear();
+            mrktCdeToIdMap.clear();
+        }
+        log.info("全部年份迁移完成，区间：{} ~ {}", startYear, endYear);
+        return "successfully";
+    }
+
+    private void processOneYear(int year, AtomicLong remainingRows,
+                                Map<String, TransactionTypesPO> txnActionMap,
+                                Map<String, Long> mrktCdeToIdMap) {
+        String originalName = Thread.currentThread().getName();
+        Thread.currentThread().setName("migration-instr-year-" + year);
+        try {
+            LocalDateTime yearStart = LocalDateTime.of(year, 1, 1, 0, 0, 0);
+            LocalDateTime yearEnd   = LocalDateTime.of(year + 1, 1, 1, 0, 0, 0);
+            long totalCount = instrumentVoucherMapper.countByVoucherDateRange(yearStart, yearEnd);
+            long yearLimit = Math.min(totalCount, remainingRows.get());
+            if (yearLimit <= 0) { log.info("[{}年] 已达到最大迁移行数限制，跳过", year); return; }
+            long totalBatches = (long) Math.ceil((double) yearLimit / PAGE_SIZE);
+            log.info("[{}年] 总记录数：{}，本次处理上限：{}，预计共 {} 批",
+                    year, totalCount, yearLimit, totalBatches);
+            int offset = 0, batchIndex = 0;
+            long processedInYear = 0;
+            while (true) {
+                long leftInYear = yearLimit - processedInYear;
+                if (leftInYear <= 0) break;
+                int fetchSize = (int) Math.min(PAGE_SIZE, leftInYear);
+                List<InstrumentVoucherPO> batch = null;
+                int maxRetry = 3;
+                for (int retry = 0; retry <= maxRetry; retry++) {
+                    try {
+                        batch = instrumentVoucherMapper.selectByVoucherDateRangePage(
+                                yearStart, yearEnd, offset, fetchSize);
+                        break;
+                    } catch (Exception e) {
+                        if (retry < maxRetry) {
+                            log.warn("[{}年] 第{}批查询失败({}/{}次重试)，原因：{}",
+                                    year, batchIndex + 1, retry + 1, maxRetry, e.getMessage());
+                            try { Thread.sleep(10_000L * (retry + 1)); }
+                            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new RuntimeException(ie); }
+                        } else {
+                            log.error("[{}年] 第{}批查询重试{}次仍失败", year, batchIndex + 1, maxRetry, e);
+                            throw e;
+                        }
+                    }
+                }
+                if (batch == null || batch.isEmpty()) break;
+                batchIndex++;
+                int fetchedSize = batch.size();
+                log.info("[{}年] 第{}/{} 批，本批 {} 条，开始处理",
+                        year, batchIndex, totalBatches, fetchedSize);
+                processBatch(batch, batchIndex, txnActionMap, mrktCdeToIdMap);
+                processedInYear += fetchedSize;
+                remainingRows.addAndGet(-fetchedSize);
+                batch.clear();
+                if (fetchedSize < fetchSize) break;
+                offset += fetchSize;
+            }
+            log.info("[{}年] 迁移完成，本年共处理 {} 条", year, processedInYear);
+        } catch (Exception e) {
+            log.error("[{}年] 迁移异常", year, e);
+        } finally {
+            Thread.currentThread().setName(originalName);
+        }
+    }
+
+    /**
+     * 批次内预加载 McInstr（按本批去重后的 instrument 列表批量查）
+     * key = instr_dsply_cde
+     */
+    private Map<String, McInstrPO> buildInstrMap(List<InstrumentVoucherPO> batch) {
+        List<String> codes = batch.stream()
+                .map(InstrumentVoucherPO::getInstrument)
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (codes.isEmpty()) return Collections.emptyMap();
+        return mcInstrMapper.findInstrListByCodes(codes).stream()
+                .filter(po -> po.getInstrDsplyCde() != null)
+                .collect(Collectors.toMap(McInstrPO::getInstrDsplyCde, po -> po, (a, b) -> a));
+    }
+
+    /**
+     * 批次内预加载 McInstclVer
+     * 先收集本批所有 instclId，批量查所有版本记录，
+     * 再按 "instclId_dateStr" 匹配有效区间，构建查找 Map
+     */
+    private Map<String, Long> buildInstclVidMap(List<InstrumentVoucherPO> batch,
+                                                Map<String, McInstrPO> instrMap) {
+        List<Long> instclIds = batch.stream()
+                .map(po -> {
+                    McInstrPO instr = instrMap.get(po.getInstrument());
+                    return instr != null ? instr.getInstclId() : null;
+                })
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (instclIds.isEmpty()) return Collections.emptyMap();
+
+        List<McInstclVerPO> verList = mcInstclVerMapper.findInstclVerListByInstclIds(instclIds);
+        // key = "instclId_yyyy-MM-dd"
+        Map<String, Long> result = new HashMap<>();
+        for (InstrumentVoucherPO po : batch) {
+            if (po.getConfirmationDate() == null) continue;
+            McInstrPO instr = instrMap.get(po.getInstrument());
+            if (instr == null || instr.getInstclId() == null) continue;
+            Long instclId = instr.getInstclId();
+            String dateKey = instclId + "_" + po.getConfirmationDate().toLocalDate().toString();
+            if (result.containsKey(dateKey)) continue;
+            LocalDate confDate = po.getConfirmationDate().toLocalDate();
+            for (McInstclVerPO ver : verList) {
+                if (!instclId.equals(ver.getInstclId())) continue;
+                if (ver.getVerEffDate() == null || ver.getVerExprDate() == null) continue;
+                LocalDate eff  = ver.getVerEffDate().toLocalDate();
+                LocalDate expr = ver.getVerExprDate().toLocalDate();
+                if (!confDate.isBefore(eff) && !confDate.isAfter(expr)) {
+                    result.put(dateKey, ver.getInstclVid());
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    private void processBatch(List<InstrumentVoucherPO> batch, int batchIndex,
+                              Map<String, TransactionTypesPO> txnActionMap,
+                              Map<String, Long> mrktCdeToIdMap) {
+        // 批次内预加载 McInstr
+        Map<String, McInstrPO> instrMap = buildInstrMap(batch);
+        // 批次内预加载 McInstclVer（依赖 instrMap）
+        Map<String, Long> instclVidMap = buildInstclVidMap(batch, instrMap);
+
+        List<McAcStkTxnDtlStatPO> mcAcStkTxnDtlStatPOList = new ArrayList<>(batch.size());
+        List<McAcStkTxnDtlPO> mcAcStkTxnDtlPOList = new ArrayList<>(batch.size());
+        List<McStkTxnPO> mcStkTxnPOList = new ArrayList<>(batch.size());
+        List<McStkMemoTxnPO> mcStkMemoTxnPOList = new ArrayList<>(batch.size());
+        List<McStkMemoTxnReqPO> mcStkMemoTxnReqPOList = new ArrayList<>(batch.size());
+        List<McLoctnStkTxnDtlPO> mcLoctnStkTxnDtlPOList = new ArrayList<>(batch.size());
+        List<InstrumentVoucherMapMSSEPO> instrumentVoucherMapMSSEPOList = new ArrayList<>(batch.size());
+
+        for (InstrumentVoucherPO items : batch) {
+            Long stkTxnRelevanceId      = idGeneratorService.generateMainId();
+            Long acStkTxnDtlRelevanceId = idGeneratorService.generateMainId();
+            Long setStkMemoTxnRelevanceId = idGeneratorService.generateMainId();
+            Long acStkTxnDtlStkStatId   = idGeneratorService.generateDetailId();
+            Long loctnStkTxnDtlId       = idGeneratorService.generateDetailId();
+            Long stkMemoTxnReqId        = idGeneratorService.generateDetailId();
+
+            // 从预加载 Map 取值，避免 N+1
+            Long instrId   = getInstrId(instrMap, items.getInstrument());
+            Long instclId  = getInstclId(instrMap, items.getInstrument());
+            Long instclVid = getInstclVid(instclVidMap, instrMap, items);
+            Long mrktId    = getMrktId(mrktCdeToIdMap, items.getMarket());
+            Long txnTypId  = getTxnTypId(txnActionMap, items.getTxnType());
+            String txnTypActnCde = getTxnTypActnCde(txnActionMap, items.getTxnType());
+            String stkStatCde   = stkStatCdeTrans(items.getLocation(), items.getTxnType(), txnActionMap);
+
+            McAcStkTxnDtlStatPO mcAcStkTxnDtlStatPO = new McAcStkTxnDtlStatPO();
+            mcAcStkTxnDtlStatPO.setAcStkTxnDtlStkStatId(acStkTxnDtlStkStatId);
+            mcAcStkTxnDtlStatPO.setAcStkTxnDtlId(acStkTxnDtlRelevanceId);
+            mcAcStkTxnDtlStatPO.setStkStatCde(stkStatCde);
+            mcAcStkTxnDtlStatPO.setStkQty(items.getQuantity());
+            mcAcStkTxnDtlStatPO.setRecVerNum(0L);
+            mcAcStkTxnDtlStatPO.setInitTime(LocalDateTime.now());
+            mcAcStkTxnDtlStatPO.setLastUpdTime(LocalDateTime.now());
+            mcAcStkTxnDtlStatPO.setLastUpdBy("MIG");
+            mcAcStkTxnDtlStatPO.setTagSeq(0L);
+
+            McStkTxnPO mcStkTxnPO = new McStkTxnPO();
+            mcStkTxnPO.setStkTxnId(stkTxnRelevanceId);
+            mcStkTxnPO.setStkAprvStatCde("APPROVED");
+            mcStkTxnPO.setIsRev("N");
+            mcStkTxnPO.setIsAwaiting("N");
+            mcStkTxnPO.setRecVerNum(0L);
+            mcStkTxnPO.setInitTime(LocalDateTime.now());
+            mcStkTxnPO.setLastUpdTime(LocalDateTime.now());
+            mcStkTxnPO.setLastUpdBy("MIG");
+            mcStkTxnPO.setTagSeq(0L);
+
+            McAcStkTxnDtlPO mcAcStkTxnDtlPO = new McAcStkTxnDtlPO();
+            mcAcStkTxnDtlPO.setAcStkTxnDtlId(acStkTxnDtlRelevanceId);
+            mcAcStkTxnDtlPO.setStkTxnId(stkTxnRelevanceId);
+            mcAcStkTxnDtlPO.setTxnTypId(txnTypId);
+            mcAcStkTxnDtlPO.setTxnTypActnCde(txnTypActnCde);
+            mcAcStkTxnDtlPO.setTxnRefNum(String.valueOf(items.getVoucherNo()));
+            mcAcStkTxnDtlPO.setCmpnyCde("TFS");
+            mcAcStkTxnDtlPO.setInstrId(instrId);
+            mcAcStkTxnDtlPO.setInstclId(instclId);
+            mcAcStkTxnDtlPO.setInstclVid(instclVid);
+            mcAcStkTxnDtlPO.setMrktId(mrktId);
+            mcAcStkTxnDtlPO.setValDate(items.getValueDate());
+            mcAcStkTxnDtlPO.setInptDate(items.getVoucherDate());
+            mcAcStkTxnDtlPO.setMrktBusdate(items.getConfirmationDate());
+            mcAcStkTxnDtlPO.setStkChnlCde(items.getManualInput().contains("Yes") ? "MANUALINP" : "SYSTEM");
+            mcAcStkTxnDtlPO.setRemrk(items.getRemark());
+            mcAcStkTxnDtlPO.setIsAutoAprv("N");
+            mcAcStkTxnDtlPO.setIsMemo("N");
+            mcAcStkTxnDtlPO.setIsTrnfr("N");
+            mcAcStkTxnDtlPO.setIsRev(isRevTrans(items));
+            mcAcStkTxnDtlPO.setIsShowInStmt("Y");
+            mcAcStkTxnDtlPO.setIsTodayRev(isTodayRevTrans(items));
+            mcAcStkTxnDtlPO.setIsIgnrDatSync("N");
+//            mcAcStkTxnDtlPO.setAcId(items.getClnt());
+            mcAcStkTxnDtlPO.setAcId("02-0000389-30");
+            mcAcStkTxnDtlPO.setPrimyRemrkFrStmt(items.getRemark());
+            mcAcStkTxnDtlPO.setStmtModuleCde("STOCK");
+            mcAcStkTxnDtlPO.setExtrnlTxnRefNum(items.getMarket() + items.getVoucherNo());
+            mcAcStkTxnDtlPO.setRecVerNum(0L);
+            mcAcStkTxnDtlPO.setInitTime(LocalDateTime.now());
+            mcAcStkTxnDtlPO.setLastUpdTime(LocalDateTime.now());
+            mcAcStkTxnDtlPO.setLastUpdBy("MIG");
+            mcAcStkTxnDtlPO.setTagSeq(0L);
+            mcAcStkTxnDtlPO.setIsTpTxn("N");
+            mcAcStkTxnDtlPO.setIsOtcrTxn("N");
+
+            //2961703
+            McStkMemoTxnPO mcStkMemoTxnPO = new McStkMemoTxnPO();
+            mcStkMemoTxnPO.setStkMemoTxnId(setStkMemoTxnRelevanceId);
+            mcStkMemoTxnPO.setCmpnyCde("TFS");
+            mcStkMemoTxnPO.setTxnTypId(txnTypId);
+            mcStkMemoTxnPO.setTxnTypActnCde(txnTypActnCde);
+            mcStkMemoTxnPO.setTxnRefNum(String.valueOf(items.getVoucherNo()));
+            mcStkMemoTxnPO.setValDate(items.getValueDate());
+            mcStkMemoTxnPO.setRemrk(items.getRemark());
+            mcStkMemoTxnPO.setPrimyRemrkFrStmt(items.getRemark());
+            mcStkMemoTxnPO.setStkReqStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
+            mcStkMemoTxnPO.setStkChnlCde(Objects.equals(items.getManualInput(), "YES") ? "MANUALINP" : "SYSTEM");
+            mcStkMemoTxnPO.setCreatBy("admin");
+            mcStkMemoTxnPO.setCreatMrktBusdate(items.getConfirmationDate());
+            mcStkMemoTxnPO.setCreatInptDate(items.getVoucherDate());
+            mcStkMemoTxnPO.setLastSubmittedBy("admin");
+            mcStkMemoTxnPO.setLastSubmittedMrktBusdate(items.getConfirmationDate());
+            mcStkMemoTxnPO.setLastSubmittedInptDate(items.getVoucherDate());
+            mcStkMemoTxnPO.setLastSubmittedTime(items.getUserIDTime());
+            mcStkMemoTxnPO.setAprvRejectDelBy(items.getApprover());
+            mcStkMemoTxnPO.setAprvRejectDelMrktBusdate(items.getConfirmationDate());
+            mcStkMemoTxnPO.setAprvRejectDelInptDate(items.getVoucherDate());
+            mcStkMemoTxnPO.setAprvRejectDelTime(items.getApprovalTime());
+            mcStkMemoTxnPO.setAcId("02-0000389-30");
+            mcStkMemoTxnPO.setInstrId(instrId);
+            mcStkMemoTxnPO.setInstclId(instclId);
+            mcStkMemoTxnPO.setInstclVid(instclVid);
+            mcStkMemoTxnPO.setMrktId(mrktId);
+            mcStkMemoTxnPO.setStkStatCde(stkStatCde);
+            mcStkMemoTxnPO.setStkQty(items.getQuantity());
+            mcStkMemoTxnPO.setRecVerNum(0L);
+            mcStkMemoTxnPO.setInitTime(LocalDateTime.now());
+            mcStkMemoTxnPO.setLastUpdTime(LocalDateTime.now());
+            mcStkMemoTxnPO.setLastUpdBy("MIG");
+            mcStkMemoTxnPO.setTagSeq(0L);
+            mcStkMemoTxnPO.setExtrnlRefNum(items.getMarket() + items.getVoucherNo());
+            mcStkMemoTxnPO.setIsTpTxn("N");
+            mcStkMemoTxnPO.setIsOtcrTxn("N");
+            mcStkMemoTxnPO.setIsRevTxn("N");
+
+            McStkMemoTxnReqPO mcStkMemoTxnReqPO = new McStkMemoTxnReqPO();
+            mcStkMemoTxnReqPO.setStkMemoTxnReqId(stkMemoTxnReqId);
+            mcStkMemoTxnReqPO.setStkMemoTxnId(setStkMemoTxnRelevanceId);
+            mcStkMemoTxnReqPO.setStkTxnId(stkTxnRelevanceId);
+            mcStkMemoTxnReqPO.setIsRev(isRevTrans(items));
+            mcStkMemoTxnReqPO.setStkReqStatCde(PropertyConverUtils.fundStatCdeTrans(items.getStatus()));
+            mcStkMemoTxnReqPO.setStkAprvStatCde("APPROVED");
+            mcStkMemoTxnReqPO.setRecVerNum(0L);
+            mcStkMemoTxnReqPO.setInitTime(LocalDateTime.now());
+            mcStkMemoTxnReqPO.setLastUpdTime(LocalDateTime.now());
+            mcStkMemoTxnReqPO.setLastUpdBy("MIG");
+            mcStkMemoTxnReqPO.setTagSeq(0L);
+
+            McLoctnStkTxnDtlPO mcLoctnStkTxnDtlPO = new McLoctnStkTxnDtlPO();
+            mcLoctnStkTxnDtlPO.setLoctnStkTxnDtlId(loctnStkTxnDtlId);
+            mcLoctnStkTxnDtlPO.setCmpnyCde("TFS");
+            mcLoctnStkTxnDtlPO.setStkTxnId(stkTxnRelevanceId);
+            mcLoctnStkTxnDtlPO.setTxnTypId(txnTypId);
+            mcLoctnStkTxnDtlPO.setTxnTypActnCde(txnTypActnCde);
+            mcLoctnStkTxnDtlPO.setTxnRefNum(String.valueOf(items.getVoucherNo()));
+            mcLoctnStkTxnDtlPO.setInstrId(instrId);
+            mcLoctnStkTxnDtlPO.setInstclId(instclId);
+            mcLoctnStkTxnDtlPO.setInstclVid(instclVid);
+            mcLoctnStkTxnDtlPO.setMrktId(mrktId);
+            mcLoctnStkTxnDtlPO.setValDate(items.getValueDate());
+            mcLoctnStkTxnDtlPO.setInptDate(items.getVoucherDate());
+            mcLoctnStkTxnDtlPO.setMrktBusdate(items.getConfirmationDate());
+            mcLoctnStkTxnDtlPO.setStkChnlCde(Objects.equals(items.getManualInput(), "YES") ? "MANUALINP" : "SYSTEM");
+            mcLoctnStkTxnDtlPO.setStkQty(items.getQuantity());
+            mcLoctnStkTxnDtlPO.setRemrk(items.getRemark());
+            mcLoctnStkTxnDtlPO.setIsMemo("N");
+            mcLoctnStkTxnDtlPO.setIsAutoAprv("N");
+            mcLoctnStkTxnDtlPO.setIsTrnfr("N");
+            mcLoctnStkTxnDtlPO.setIsRev(isRevTrans(items));
+            mcLoctnStkTxnDtlPO.setIsShowInStmt("Y");
+            mcLoctnStkTxnDtlPO.setIsTodayRev(isTodayRevTrans(items));
+//            mcLoctnStkTxnDtlPO.setRevLoctnStkTxnDtlId("N");
+            mcLoctnStkTxnDtlPO.setIsIgnrDatSync("N");
+            mcLoctnStkTxnDtlPO.setStkStatCde(stkStatCde);
+            mcLoctnStkTxnDtlPO.setRecVerNum(0L);
+            mcLoctnStkTxnDtlPO.setInitTime(LocalDateTime.now());
+            mcLoctnStkTxnDtlPO.setLastUpdTime(LocalDateTime.now());
+            mcLoctnStkTxnDtlPO.setLastUpdBy("MIG");
+            mcLoctnStkTxnDtlPO.setTagSeq(0L);
+
+            InstrumentVoucherMapMSSEPO instrumentVoucherMapMSSEPO = new InstrumentVoucherMapMSSEPO();
+            instrumentVoucherMapMSSEPO.setVoucherNo(items.getVoucherNo());
+            instrumentVoucherMapMSSEPO.setMarket(items.getMarket());
+            instrumentVoucherMapMSSEPO.setAcStkTxnDtlStkStatId(acStkTxnDtlStkStatId);
+            instrumentVoucherMapMSSEPO.setAcStkTxnDtlId(acStkTxnDtlRelevanceId);
+            instrumentVoucherMapMSSEPO.setStkMemoTxnId(setStkMemoTxnRelevanceId);
+            instrumentVoucherMapMSSEPO.setStkMemoTxnReqId(stkMemoTxnReqId);
+
+            mcAcStkTxnDtlStatPOList.add(mcAcStkTxnDtlStatPO);
+            mcStkTxnPOList.add(mcStkTxnPO);
+            mcAcStkTxnDtlPOList.add(mcAcStkTxnDtlPO);
+            mcStkMemoTxnPOList.add(mcStkMemoTxnPO);
+            mcStkMemoTxnReqPOList.add(mcStkMemoTxnReqPO);
+            mcLoctnStkTxnDtlPOList.add(mcLoctnStkTxnDtlPO);
+            instrumentVoucherMapMSSEPOList.add(instrumentVoucherMapMSSEPO);
+        }
+
+        // 写入 Oracle（带重试机制）
+        saveToOracleWithRetry("McStkTxn",          batchIndex, () -> saveToMcStkTxn(mcStkTxnPOList));
+        saveToOracleWithRetry("McAcStkTxnDtl",     batchIndex, () -> saveToMcAcStkTxnDtl(mcAcStkTxnDtlPOList));
+        saveToOracleWithRetry("McAcStkTxnDtlStat", batchIndex, () -> saveToMcAcStkTxnDtlStat(mcAcStkTxnDtlStatPOList));
+        saveToOracleWithRetry("McStkMemoTxn",      batchIndex, () -> saveToMcStkMemoTxn(mcStkMemoTxnPOList));
+        saveToOracleWithRetry("McStkMemoTxnReq",   batchIndex, () -> saveToMcStkMemoTxnReq(mcStkMemoTxnReqPOList));
+        saveToOracleWithRetry("McLoctnStkTxnDtl",  batchIndex, () -> saveToMcLoctnStkTxnDtl(mcLoctnStkTxnDtlPOList));
+        // InstrumentVoucherMapMSSE 是 SQL Server 侧的映射表，直接写入
+        instrumentVoucherMapMSSEMapper.insert(instrumentVoucherMapMSSEPOList);
+
+        mcAcStkTxnDtlStatPOList.clear();
+        mcAcStkTxnDtlPOList.clear();
+        mcStkTxnPOList.clear();
+        mcStkMemoTxnPOList.clear();
+        mcStkMemoTxnReqPOList.clear();
+        mcLoctnStkTxnDtlPOList.clear();
+        instrumentVoucherMapMSSEPOList.clear();
+    }
+
+    // ==============================
+    // Map 查找辅助方法（均从预加载 Map 取值，无数据库调用）
+    // ==============================
+
+    private Long getInstrId(Map<String, McInstrPO> instrMap, String instrument) {
+        McInstrPO po = instrMap.get(instrument);
+        return po != null ? po.getInstrId() : null;
+    }
+
+    private Long getInstclId(Map<String, McInstrPO> instrMap, String instrument) {
+        McInstrPO po = instrMap.get(instrument);
+        return po != null ? po.getInstclId() : null;
+    }
+
+    private Long getInstclVid(Map<String, Long> instclVidMap,
+                               Map<String, McInstrPO> instrMap,
+                               InstrumentVoucherPO po) {
+        if (po.getConfirmationDate() == null) return null;
+        McInstrPO instr = instrMap.get(po.getInstrument());
+        if (instr == null || instr.getInstclId() == null) return null;
+        String key = instr.getInstclId() + "_" + po.getConfirmationDate().toLocalDate().toString();
+        return instclVidMap.get(key);
+    }
+
+    /** market source code -> MSSE mrktCde 映射（与原 marketCodeConversion 逻辑一致） */
+    private Long getMrktId(Map<String, Long> mrktCdeToIdMap, String market) {
+        String code;
+        switch (market == null ? "" : market) {
+            case "AUS": code = "AUS"; break;
+            case "BOD": case "BON": case "DEO": case "DEV": case "FUN": case "MMF": code = "OTC"; break;
+            case "CAN": code = "TSX"; break;
+            case "CHA": code = "SZSEA"; break;
+            case "CHE": code = "SIX"; break;
+            case "DEU": code = "FSE"; break;
+            case "FRA": code = "PARIS"; break;
+            case "HKG": code = "HKEX"; break;
+            case "JPN": code = "OSE"; break;
+            case "KOR": code = "KSE"; break;
+            case "MAL": code = "KLSE"; break;
+            case "SHA": code = "HKSSE"; break;
+            case "SHB": code = "SSE"; break;
+            case "SIN": code = "SGX"; break;
+            case "SZA": code = "HKSZSE"; break;
+            case "SZB": code = "SZSE"; break;
+            case "TWN": code = "TSEC"; break;
+            case "UKG": code = "LSE"; break;
+            case "USA": code = "NYSEMKT"; break;
+            default: code = ""; break;
+        }
+        return mrktCdeToIdMap.get(code);
+    }
+
+    private Long getTxnTypId(Map<String, TransactionTypesPO> txnActionMap, String txnType) {
+        TransactionTypesPO po = txnActionMap.get(txnType);
+        if (po == null || po.getSignIndicator() == null) return null;
+        return po.getSignIndicator().equals("D") ? 2501L : 2522L;
+    }
+
+    private String getTxnTypActnCde(Map<String, TransactionTypesPO> txnActionMap, String txnType) {
+        TransactionTypesPO po = txnActionMap.get(txnType);
+        if (po == null || po.getSignIndicator() == null) return " ";
+        return po.getSignIndicator().equals("D") ? "IN" : "OUT";
+    }
+
+    private String stkStatCdeTrans(String location, String txnType,
+                                   Map<String, TransactionTypesPO> txnActionMap) {
+        switch (location == null ? "" : location) {
+            case "NOM":   return "NOMINEE";
+            case "OWM":   return "OWNERNAME";
+            case "BONUS": return "BONUS";
+            case "ST":
+                TransactionTypesPO po = txnActionMap.get(txnType);
+                if (po != null && po.getSignIndicator() != null) {
+                    return po.getSignIndicator().equals("D") ? "DIP" : "WIP";
+                }
+                return null;
+            default: return " ";
+        }
+    }
+
+    /**
      * 带重试的 Oracle 写入封装
-     * 遇到网络 IO 类异常（Oracle 17002 / BatchUpdateException）最多重试 3 次，
-     * 每次等待递增（10s / 20s / 30s），让 HikariCP 有时间重建可用连接后再重试。
      */
     private void saveToOracleWithRetry(String tableName, int batchIndex, Runnable saveAction) {
         int maxRetry = 3;
         for (int retry = 0; retry <= maxRetry; retry++) {
             try {
                 saveAction.run();
-                return; // 写入成功，直接返回
+                return;
             } catch (Exception e) {
                 boolean isIoError = e.getMessage() != null &&
                         (e.getMessage().contains("IO Error") ||
@@ -27,20 +573,108 @@
                     long waitSeconds = 10L * (retry + 1);
                     log.warn("[Oracle写入] 表={} 第{}批 写入失败（第{}/{}次重试），{}秒后重试。原因：{}",
                             tableName, batchIndex, retry + 1, maxRetry, waitSeconds, e.getMessage());
-                    try {
-                        Thread.sleep(waitSeconds * 1000L);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new RuntimeException("Oracle写入重试等待被中断", ie);
-                    }
+                    try { Thread.sleep(waitSeconds * 1000L); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new RuntimeException("Oracle写入重试等待被中断", ie); }
                 } else {
-                    // 非 IO 类错误或已超过最大重试次数，直接抛出
-                    log.error("[Oracle写入] 表={} 第{}批 写入失败，已重试{}次，放弃。",
-                            tableName, batchIndex, retry, e);
+                    log.error("[Oracle写入] 表={} 第{}批 写入失败，已重试{}次，放弃。", tableName, batchIndex, retry, e);
                     throw e;
                 }
             }
         }
     }
 
-    // batchSize=200：单次 executeBatch() 发送约1MB，降低单包体积，减少 Oracle IO Error(17002) 概率
+    // 注意：不可叠加 @Transactional，否则外层事务会长期持有同一个连接不归还
+    @DS("oracle")
+    public void saveToMcAcStkTxnDtlStat(List<McAcStkTxnDtlStatPO> list) { mcAcStkTxnDtlStatMapper.batchInsert(list); }
+
+    @DS("oracle")
+    public void saveToMcAcStkTxnDtl(List<McAcStkTxnDtlPO> list) { mcAcStkTxnDtlMapper.batchInsert(list); }
+
+    @DS("oracle")
+    public void saveToMcStkTxn(List<McStkTxnPO> list) { mcStkTxnMapper.batchInsert(list); }
+
+    @DS("oracle")
+    public void saveToMcStkMemoTxn(List<McStkMemoTxnPO> list) { mcStkMemoTxnMapper.batchInsert(list); }
+
+    @DS("oracle")
+    public void saveToMcStkMemoTxnReq(List<McStkMemoTxnReqPO> list) { mcStkMemoTxnReqMapper.batchInsert(list); }
+
+    @DS("oracle")
+    public void saveToMcLoctnStkTxnDtl(List<McLoctnStkTxnDtlPO> list) { mcLoctnStkTxnDtlMapper.batchInsert(list); }
+
+    private String isRevTrans(InstrumentVoucherPO po) {
+        //2019-06-05 00:00:00.000
+        if (po.getCancelDate() != null && po.getConfirmationDate() != null) {
+            if (!po.getCancelDate().equals(po.getConfirmationDate()) && po.getStatus().contains("CAN")) return "Y";
+        }
+        return "N";
+    }
+
+    private String isTodayRevTrans(InstrumentVoucherPO po) {
+        //2019-06-05 00:00:00.000
+        if (po.getCancelDate() != null && po.getConfirmationDate() != null) {
+            if (po.getCancelDate().equals(po.getConfirmationDate()) && po.getStatus().contains("CAN")) return "Y";
+        }
+        return "N";
+    }
+}
+
+
+
+
+public interface McMrktMapper extends BaseMapper<McMrktPO> {
+
+    @Select("select mrkt_id  from mc_mrkt where  mrkt_cde = #{code}")
+    McMrktPO findInstrIdByCode(@Param("code") String code);
+
+    /**
+     * 一次性加载全部市场映射，用于预加载 Map，避免 N+1
+     */
+    @Select("select mrkt_id, mrkt_cde from mc_mrkt")
+    List<McMrktPO> findAllMrkt();
+
+}
+
+public interface McInstrMapper extends BaseMapper<McInstrPO> {
+
+    @Select("select instr_id,instcl_id from mc_instr where instr_dsply_cde = #{code}")
+    McInstrPO findInstrIdByCode(@Param("code") String code);
+
+    @Select("select instr_id,instcl_id from mc_instr where instr_dsply_cde = #{code}")
+    List<McInstrPO> findInstrIdByCodeList(@Param("code") String code);
+
+    @Select("select instcl_id from mc_instr where instr_dsply_cde = #{instrument}")
+    McInstrPO findInstclVidByInstrument(@Param("instrument") String code);
+
+    /**
+     * 批量查询，用于批次内预加载，key = instr_dsply_cde
+     */
+    @Select({"<script>",
+            "select instr_id, instcl_id, instr_dsply_cde from mc_instr",
+            "where instr_dsply_cde in",
+            "<foreach item='item' collection='codes' open='(' separator=',' close=')'>",
+            "#{item}",
+            "</foreach>",
+            "</script>"})
+    List<McInstrPO> findInstrListByCodes(@Param("codes") List<String> codes);
+}
+
+public interface McInstclVerMapper extends BaseMapper<McInstclVerPO> {
+
+    @Select("SELECT INSTCL_VID FROM MC_INSTCL_VER miv WHERE INSTCL_ID = #{vid} AND to_date(substr(#{date},1,10),'YYYY-MM-DD') BETWEEN VER_EFF_DATE AND VER_EXPR_DATE")
+    McInstclVerPO findInstclVidByDate(@Param("vid") Long vid, @Param("date") String date);
+
+    /**
+     * 批量查询 instclVid，用于批次内预加载，避免 N+1
+     * key 由调用方拼接为 "instclId_date"
+     */
+    @Select({"<script>",
+            "SELECT INSTCL_VID, INSTCL_ID, VER_EFF_DATE, VER_EXPR_DATE FROM MC_INSTCL_VER",
+            "WHERE INSTCL_ID IN",
+            "<foreach item='id' collection='instclIds' open='(' separator=',' close=')'>",
+            "#{id}",
+            "</foreach>",
+            "</script>"})
+    List<McInstclVerPO> findInstclVerListByInstclIds(@Param("instclIds") List<Long> instclIds);
+
+}
